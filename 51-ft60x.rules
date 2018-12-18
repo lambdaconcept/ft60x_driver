@@ -1,1 +1,2 @@
+SUBSYSTEM=="usbmisc", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="601e", MODE="0666", GROUP="plugdev"
 SUBSYSTEM=="usbmisc", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="601f", MODE="0666", GROUP="plugdev"
