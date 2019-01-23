@@ -88,6 +88,7 @@ static ssize_t ft60x_data_read(struct file *file, char *user_buffer,
 			       size_t count, loff_t * ppos);
 static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 				size_t count, loff_t * ppos);
+static __poll_t ft60x_data_poll(struct file *file, poll_table *wait);
 
 static struct class *class = NULL;	/* The device-driver class struct pointer */
 static dev_t devt;		/* Global variable for the first device number */
@@ -112,7 +113,7 @@ static const struct file_operations ft60x_data_fops = {
 	.open =		ft60x_data_open,
 	.release =	ft60x_data_release,
 	.flush =	NULL,
-	.poll =		NULL,
+	.poll =		ft60x_data_poll,
 	.unlocked_ioctl = NULL,
 	.llseek =	noop_llseek,
 };
@@ -1034,6 +1035,43 @@ static int ft60x_data_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static __poll_t ft60x_data_poll(struct file *file, poll_table *wait)
+{
+	__poll_t ret = 0;
+	struct ft60x_endpoint *ep;
+
+	printk(KERN_INFO "%s called\n", __func__);
+
+	ep = file->private_data;
+	if (ep == NULL)
+		return -ENODEV;
+
+	poll_wait(file, &ep->bulk_in_wait, wait);
+	// XXX add poll_wait for bulk_out_wait ??
+
+	// XXX need mutex / lock ??
+	if (!ep->data_dev->interface) {
+		return EPOLLHUP;
+	}
+
+	// XXX need mutex / lock ??
+	if (ft60x_ring_has_data(&ep->ring)) {
+		ret |= EPOLLIN | EPOLLRDNORM;
+	}
+
+	// XXX use down_timeout
+	if (!down_trylock(&ep->limit_sem)) {
+		/*
+		 * we acquired the semaphore,
+		 * write in flight limit no reached yet, release sem
+		 */
+		up(&ep->limit_sem);
+		ret |= EPOLLOUT;
+	}
+
+	return ret;
+}
+
 static int ft60x_send_ctrlreq(struct ft60x_ctrl_dev *ctrl_dev,
 			      bool asynchronous)
 {
@@ -1198,6 +1236,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	}
 
 	/* get the next empty node from the ring buffer */
+	// XXX what if char dev is not opened
 	ret = ft60x_ring_add_node(&ep->ring);
 	if (ret < 0) {
 		return ret;
