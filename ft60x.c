@@ -27,9 +27,9 @@
 #define USB_FT601_PRODUCT_ID	0x601f
 #define USB_FT600_PRODUCT_ID	0x601e
 
-#define FT60X_EP_PAIR_MAX       4
-#define FT60X_DEVICE_NAME       "ft60x"
-#define FT60X_MAX_MINORS        256
+#define FT60X_EP_PAIR_MAX	4
+#define FT60X_DEVICE_NAME	"ft60x"
+#define FT60X_MAX_MINORS	256
 
 /* table of devices that work with this driver */
 static const struct usb_device_id ft60x_table[] = {
@@ -39,7 +39,6 @@ static const struct usb_device_id ft60x_table[] = {
 };
 
 MODULE_DEVICE_TABLE(usb, ft60x_table);
-
 
 /* Get a minor  */
 #ifdef CONFIG_USB_DYNAMIC_MINORS
@@ -81,35 +80,33 @@ static struct usb_driver ft60x_driver;
 static int ft60x_open(struct inode *inode, struct file *file);
 static int ft60x_data_open(struct inode *inode, struct file *file);
 
-static struct class* class  = NULL; ///< The device-driver class struct pointer
+static struct class* class = NULL; // The device-driver class struct pointer
 static dev_t devt; // Global variable for the first device number
 static char ft60x_minors[FT60X_MAX_MINORS / FT60X_EP_PAIR_MAX];
 
 static const struct file_operations ft60x_fops = {
-        .owner =        THIS_MODULE,
-        .read =         NULL,
-        .write =        NULL,
-        .open =         ft60x_open,
+	.owner =        THIS_MODULE,
+	.read =         NULL,
+	.write =        NULL,
+	.open =         ft60x_open,
 	.release =      NULL,
 	.flush =        NULL,
-        .poll =         NULL,
-        .unlocked_ioctl =       NULL,
+	.poll =         NULL,
+	.unlocked_ioctl =       NULL,
 	.llseek =       noop_llseek,
 };
-
 
 static const struct file_operations ft60x_data_fops = {
-        .owner =        THIS_MODULE,
-        .read =         NULL,
-        .write =        NULL,
-        .open =         ft60x_data_open,
+	.owner =        THIS_MODULE,
+	.read =         NULL,
+	.write =        NULL,
+	.open =         ft60x_data_open,
 	.release =      NULL,
 	.flush =        NULL,
-        .poll =         NULL,
-        .unlocked_ioctl =       NULL,
+	.poll =         NULL,
+	.unlocked_ioctl =       NULL,
 	.llseek =       noop_llseek,
 };
-
 
 static void ft60x_print_usb_log(struct usb_interface *intf,
                                 const struct usb_device_id *id)
@@ -155,7 +152,6 @@ struct ft60x_ring_s {
 };
 
 struct ft60x_ctrl_dev {
-
 	struct usb_device       *device;
 	struct usb_interface    *interface;
 	struct list_head         ctrl_list;
@@ -172,7 +168,6 @@ struct ft60x_ctrl_dev {
 	struct kref              kref;
 
 	struct ft60x_config      ft60x_cfg;
-	
 };
 
 struct ft60x_endpoint {
@@ -181,7 +176,7 @@ struct ft60x_endpoint {
 	struct urb              *bulk_in_urb;            /* the urb to read data with */
 	struct ft60x_ring_s      ring;                   /* Our RING structure to add data in */
 	struct ft60x_data_dev   *data_dev;
-    struct cdev              cdev;
+	struct cdev              cdev;
 };
 
 struct ft60x_data_dev {
@@ -193,13 +188,10 @@ struct ft60x_data_dev {
 	struct usb_device       *udev;                  /* the usb device for this device */
 	
 	int                      major;                 /* Major of the chardev */
-    int                      baseminor;             /* First minor in the data ep group */
+	int                      baseminor;             /* First minor in the data ep group */
 	struct kref              kref;
 	struct ft60x_endpoint    ep_pair[FT60X_EP_PAIR_MAX];                 /* 4 different endpoint max */
 };
-
-
-
 
 static void ft60x_ring_add_elem(struct ft60x_ring_s *l)
 {
@@ -241,7 +233,6 @@ static void ft60x_ring_init(struct ft60x_ring_s *r)
 	*/
 }
 
-
 static size_t ft60x_ring_read(struct ft60x_ring_s *r, char *buf, size_t len)
 {
 	char *pnt = buf;
@@ -269,7 +260,6 @@ static size_t ft60x_ring_read(struct ft60x_ring_s *r, char *buf, size_t len)
 	return len - rlen;
 }
 
-
 void ft60x_ring_free(struct ft60x_ring_s *r)
 {
 	struct ft60x_node_s *p= &r->first;
@@ -291,7 +281,6 @@ void ft60x_ring_free(struct ft60x_ring_s *r)
 	}while(o != p);
 	
 }
-
 
 static void ft60x_int_callback(struct urb *urb)
 {
@@ -364,6 +353,8 @@ static int ft60x_set_config(struct ft60x_ctrl_dev *ctrl_dev,
                               cfg, sizeof(struct ft60x_config),
                               USB_CTRL_SET_TIMEOUT);
 
+	printk("RETURN FROM CONFIG\n");
+
 	if (ret < 0) {
                 ret = -EIO;
 		goto exit;
@@ -374,7 +365,6 @@ exit:
 
         return ret;
 }
-
 
 static int ft60x_get_config(struct ft60x_ctrl_dev *ctrl_dev)
 {
@@ -413,7 +403,6 @@ exit:
         return retval;
 }
 
-
 static int ft60x_get_unknown(struct ft60x_ctrl_dev *ctrl_dev)
 {
         int retval;
@@ -446,8 +435,6 @@ exit:
         }
         return retval;
 }
-
-
 
 static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 					 const struct usb_device_id *id)
@@ -505,8 +492,6 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 		}
 	}
 
-
-		
 	for (i = 0; i < host_interface->desc.bNumEndpoints; ++i) {
 		endpoint = &host_interface->endpoint[i].desc;
 		
@@ -571,9 +556,6 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 	ft60x_print_config(&ctrl_dev->ft60x_cfg);
 	retval = ft60x_get_unknown(ctrl_dev);
 
-
-	 
-
 	return retval;
 error:
 	printk(KERN_INFO "ERRROOOOOOOOOR\n");
@@ -585,36 +567,22 @@ error:
 
 static int ft60x_add_device(struct ft60x_data_dev *data_dev, int minor, int idx)
 {
-	
-	struct device* device = NULL; ///< The device-driver device struct pointer
-    dev_t newdev;
-    int ret;
-	
-	/*
-	if(!class){
-		class = class_create(THIS_MODULE, "ft60x");
-		if (IS_ERR(class)){
-			printk(KERN_ALERT "Failed to register device class\n");
-			goto error;
-		}
-		printk(KERN_INFO "EBBChar: device class registered correctly\n");
-	}
-	*/
-	
- 
+	struct device* device = NULL;
+	dev_t newdev;
+	int ret;
+
 	// Register the device driver
-    newdev = MKDEV(data_dev->major, data_dev->baseminor + idx);
+	newdev = MKDEV(data_dev->major, data_dev->baseminor + idx);
 	printk(KERN_INFO "device_create: %d %d %d\n", data_dev->major, minor , idx);
-    printk(KERN_INFO "drvdata: %p\n", &data_dev->ep_pair[idx]);
+	printk(KERN_INFO "drvdata: %p\n", &data_dev->ep_pair[idx]);
 	device = device_create(class, NULL, newdev, NULL, "ft60x%d%c", minor, idx + 'a');
-	if (IS_ERR(device)){               // Clean up if there is an error
+	if (IS_ERR(device)){
 		printk(KERN_ALERT "Failed to create the device\n");
 		goto error;
 	}
 
-    cdev_init(&data_dev->ep_pair[idx].cdev, &ft60x_data_fops);
-    if ((ret = cdev_add(&data_dev->ep_pair[idx].cdev, newdev, 1)) < 0)
-	{
+	cdev_init(&data_dev->ep_pair[idx].cdev, &ft60x_data_fops);
+	if ((ret = cdev_add(&data_dev->ep_pair[idx].cdev, newdev, 1)) < 0) {
 		printk(KERN_ALERT "Failed to add the device\n");
 		return ret;
 	}
@@ -628,26 +596,24 @@ error:
  
 static int ft60x_register_baseminor(void)
 {
-    int i;
+	int i;
 
-    for (i=0; i<sizeof(ft60x_minors); i++)
-    {
-        if (!ft60x_minors[i])
-        {
-            ft60x_minors[i] = 1;
-            return i * FT60X_EP_PAIR_MAX;
-        }
-    }
+	for (i=0; i<sizeof(ft60x_minors); i++) {
+		if (!ft60x_minors[i]) {
+			ft60x_minors[i] = 1;
+			return i * FT60X_EP_PAIR_MAX;
+		}
+	}
 
-    return -1;
+	return -1;
 }
 
 static void ft60x_unregister_baseminor(int baseminor)
 {
-    int idx = baseminor / FT60X_EP_PAIR_MAX;
+	int idx = baseminor / FT60X_EP_PAIR_MAX;
 
-    if (idx < sizeof(ft60x_minors))
-        ft60x_minors[idx] = 0;
+	if (idx < sizeof(ft60x_minors))
+		ft60x_minors[idx] = 0;
 }
 
 static int ft60x_allocate_data_interface(struct usb_interface *interface,
@@ -675,42 +641,23 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
 		data_dev->ep_pair[i].data_dev = data_dev;
 	}
-		
+
 	data_dev->device = device;
 	data_dev->udev = usb_get_dev(device);
 	data_dev->interface = interface;
 	data_dev->devnum = device->devnum;
+	data_dev->major = MAJOR(devt);
+
+	data_dev->baseminor = ft60x_register_baseminor();
+	if (data_dev->baseminor < 0) {
+		printk("ERR Alloc minor\n");
+		goto error;
+	}
 
 	kref_init(&data_dev->kref);
 
 	usb_set_intfdata(interface, data_dev);
 	
-	// data_dev->major = register_chrdev(0, "ft60x", &ft60x_data_fops);
-    // register_chrdev_region(MKDEV(data_dev->major, 0), 0, "ft60x");
-	// if (data_dev->major < 0){
-	// 	printk(KERN_ALERT "failed to register a major number\n");
-	// 	goto error;
-	// }
-	// printk(KERN_INFO "Rregistered correctly with major number %d\n", data_dev->major);
-
-    /* Allocate a major number */
-	/*
-    if(MAJOR(first) == 0)
-    {
-        if ((retval = alloc_chrdev_region(&first, 0, 256, DEVICE_NAME)) < 0)
-	    {
-	        printk(KERN_ALERT "failed to alloc region\n");
-	    	goto error;
-	    }
-    }
-	*/
-    data_dev->major = MAJOR(devt);
-    data_dev->baseminor = ft60x_register_baseminor();
-    if (data_dev->baseminor < 0) {
-        printk("ERR Alloc minor\n");
-        goto error;
-    }
-
 	/* Attemp to find the ctrl interface of this ctrl intf */
 	list_for_each_entry(ctrl_dev, &ft60x_ctrl_list, ctrl_list) {
 		if(ctrl_dev->devnum ==  data_dev->devnum){
@@ -721,8 +668,6 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 		}
 	}
 
-
-	
 	for (i = 0; i < host_interface->desc.bNumEndpoints; i++) {
 
 		endpoint = &host_interface->endpoint[i].desc;
@@ -769,18 +714,16 @@ error:
 
 static int ft60x_data_open(struct inode *inode, struct file *file)
 {
-    unsigned int mj = imajor(inode);
+	unsigned int mj = imajor(inode);
 	unsigned int mn = iminor(inode);
-    struct ft60x_endpoint *ep;
+	struct ft60x_endpoint *ep;
 
 	printk(KERN_INFO "%s called\n", __func__);
 	printk(KERN_INFO "major: %i, minor: %i\n", mj, mn);
 
-    // inode->i_cdev;
-    // inode->i_private;
-    ep = container_of(inode->i_cdev, struct ft60x_endpoint, cdev);
+	ep = container_of(inode->i_cdev, struct ft60x_endpoint, cdev);
 
-    file->private_data = ep;
+	file->private_data = ep;
 	printk(KERN_INFO "prvdata: %p\n", file->private_data);
 
 	return 0;
@@ -825,7 +768,7 @@ static int ft60x_open(struct inode *inode, struct file *file)
 
 	memcpy(&cstm, &ctrl_dev->ft60x_cfg, sizeof(struct ft60x_config));
 	cstm.FIFOMode=1;
-	cstm.ChannelConfig=0;
+	cstm.ChannelConfig=0; // XXX 0
 	
 	retval = ft60x_set_config(ctrl_dev, &cstm);
 
@@ -922,7 +865,7 @@ static void ft60x_delete_data(struct kref *kref)
 		ft60x_ring_free(&data_dev->ep_pair[i].ring);
 	}
 		
-	kfree(data_dev);	
+	kfree(data_dev);
 }
 
 static int ft60x_suspend(struct usb_interface *intf, pm_message_t message)
@@ -950,13 +893,11 @@ static int ft60x_post_reset(struct usb_interface *intf)
         return 0;
 }
 
-
 static void ft60x_disconnect(struct usb_interface *interface)
 {
 	struct usb_host_interface *host_interface;
 	struct ft60x_ctrl_dev *ctrl_dev;
 	struct ft60x_data_dev *data_dev;
-	int last=1;
 	int i;
 	
 	host_interface = interface->cur_altsetting;
@@ -964,7 +905,6 @@ static void ft60x_disconnect(struct usb_interface *interface)
 	printk(KERN_INFO "%s called\n", __func__);
 	
 	if(host_interface->desc.bInterfaceNumber == 0) {
-
 		/* ctrl interface */
 
 		ctrl_dev = usb_get_intfdata(interface);
@@ -972,67 +912,37 @@ static void ft60x_disconnect(struct usb_interface *interface)
 		
 		kref_put(&ctrl_dev->kref, ft60x_delete_ctrl);
 
-		
 	} else {
-		
 		/* data interface */
 		
 		data_dev = usb_get_intfdata(interface);
 		
-		for(i = 0; i < FT60X_EP_PAIR_MAX; i++){
-			if(data_dev->ep_pair[i].used){
-                cdev_del(&data_dev->ep_pair[i].cdev);
+		for(i = 0; i < FT60X_EP_PAIR_MAX; i++) {
+			if(data_dev->ep_pair[i].used) {
+				cdev_del(&data_dev->ep_pair[i].cdev);
 				device_destroy(class, MKDEV(data_dev->major, data_dev->baseminor + i));
 			}
 		}
-		
-        ft60x_unregister_baseminor(data_dev->baseminor);
-		// unregister_chrdev_region(data_dev->major, FT60X_EP_PAIR_MAX);
+
+		ft60x_unregister_baseminor(data_dev->baseminor);
 
 		list_del(&data_dev->data_list);
 
 		kref_put(&data_dev->kref, ft60x_delete_data);
-		
 	}
 	
 	usb_deregister_dev(interface, &ft60x_class);
-
-	/*  When everything has been removed, we can remove the class, 
-	 *  will re-create it later if needed 
-	 */
-	
-	/*
-	list_for_each_entry(ctrl_dev, &ft60x_ctrl_list, ctrl_list) {
-		last=0;
-		break;
-	}
-	
-	list_for_each_entry(data_dev, &ft60x_data_list, data_list) {
-		last=0;
-		break;
-	}
-	*/
-	
-	/*
-	if(last){
-		printk(KERN_INFO "YES WAS LAST\n");
-		class_unregister(class);
-		class_destroy(class);
-		class=NULL;
-	}
-	*/
-	
 }
 
 static struct usb_driver ft60x_driver = {
-        .name =         "ft60x",
+	.name =         "ft60x",
 	.probe =        ft60x_probe,
-        .disconnect =   ft60x_disconnect,
+	.disconnect =   ft60x_disconnect,
 	.suspend =      ft60x_suspend,
-        .resume =       ft60x_resume,
+	.resume =       ft60x_resume,
 	.pre_reset =    ft60x_pre_reset,
-        .post_reset =   ft60x_post_reset,
-        .id_table =     ft60x_table,
+	.post_reset =   ft60x_post_reset,
+	.id_table =     ft60x_table,
 	.supports_autosuspend = 1,
 };
 
@@ -1046,7 +956,7 @@ static int __init ft60x_init(void)
 		return PTR_ERR(class);
 	}
 
-	rc = alloc_chrdev_region(&devt, 0, FT60X_MAX_MINORS , FT60X_DEVICE_NAME);
+	rc = alloc_chrdev_region(&devt, 0, FT60X_MAX_MINORS, FT60X_DEVICE_NAME);
 	if (rc) {
 		pr_err("failed to allocate char dev region\n");
 		goto err_region;
@@ -1061,7 +971,7 @@ static int __init ft60x_init(void)
 	return rc;
 
 err_usb:
-	unregister_chrdev_region(devt, FT60X_MAX_MINORS );
+	unregister_chrdev_region(devt, FT60X_MAX_MINORS);
 err_region:
 	class_destroy(class);
 	class = NULL;
@@ -1072,16 +982,14 @@ err_region:
 static void __exit ft60x_exit(void)
 {
 	usb_deregister(&ft60x_driver);
-	unregister_chrdev_region(devt, FT60X_MAX_MINORS );
+	unregister_chrdev_region(devt, FT60X_MAX_MINORS);
 	class_destroy(class);
 	class = NULL;
 }
 
 module_init(ft60x_init);
 module_exit(ft60x_exit);
-// module_usb_driver(ft60x_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ramtin Amin <ramtin@lambdaconcept.com>");
 MODULE_DESCRIPTION("FT60x Driver");
-
