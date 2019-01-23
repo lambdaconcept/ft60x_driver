@@ -148,18 +148,20 @@ static void ft60x_print_usb_log(struct usb_interface *intf,
 
 struct ft60x_ctrlreq {
 	u32 idx;
-	u8 pipe;
+	u8 ep;
 	u8 cmd;
 	u8 unk1;
 	u8 unk2;
-	u32 len;
+	u16 len;
+	u16 unk3;
 	u32 unk4;
 	u32 unk5;
 } __attribute__ ((packed));
 
 struct ft60x_irqresp {
 	u32 idx;
-	u16 ep;
+	u8 ep;
+	u8 cmd;
 	u16 len;
 	u32 unk1;
 } __attribute__ ((packed));
@@ -194,6 +196,7 @@ struct ft60x_endpoint {
 	__u8			bulk_out_endpointAddr;	/* the address of the bulk out endpoint */
 	bool 			busy_write;		/* for the writing poll */
 	bool			ongoing_read;		/* a read is going on */
+	bool			waiting_notif;		/* waiting for data available notification  */
 	int 			errors;			/* the last request tanked */
 	spinlock_t		err_lock;		/* lock for errors */
 	struct mutex		io_rd_mutex;		/* synchronize I/O with disconnect */
@@ -231,12 +234,13 @@ struct ft60x_ctrl_dev {
 	dma_addr_t               int_in_data_dma;        /* the dma buffer to receive int data */
 	struct kref              kref;
 	struct ft60x_config      ft60x_cfg;
-	struct ft60x_ctrlreq	 ctrlreq;
 	struct mutex		 io_mutex;		/* synchronize I/O with disconnect */
+	struct ft60x_ctrlreq	ctrlreq;
 };
 
+static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count);
 
-static int ft60x_ring_add_elem(struct ft60x_ring_s *l)
+static int ft60x_ring_add_node(struct ft60x_ring_s *l)
 {
 	struct ft60x_node_s *tmp;
 
@@ -302,7 +306,12 @@ static ssize_t ft60x_ring_read(struct ft60x_ring_s *r, char *user_buffer, size_t
 	while(r->rd->len) {
 		printk(KERN_INFO "Ring read: using node %p, %ld, %ld\n", r->rd, r->rd->len, r->rd->used);
 		if(r->rd->len < rlen) {
-			/* we are asked for more than we have */
+			/* 
+ 			 * we are asked for more data than we have on the
+			 * current node.
+			 * copy any available data, empty the node and go to
+			 * the next node until the ring is exhausted.
+			 */
 			printk(KERN_INFO "copy_to_user 1\n");
 			if (copy_to_user(pnt,
 					 r->rd->bulk_in_buffer + r->rd->used,
@@ -317,7 +326,10 @@ static ssize_t ft60x_ring_read(struct ft60x_ring_s *r, char *user_buffer, size_t
 			if(r->rd == r->wr)
 				return len - rlen;
 		} else {
-			/* enough data */
+			/* 
+ 			 * enough data.
+			 * copy the requested amount.
+			 */
 			printk(KERN_INFO "copy_to_user 2\n");
 			if (copy_to_user(pnt,
 					 r->rd->bulk_in_buffer + r->rd->used,
@@ -327,12 +339,29 @@ static ssize_t ft60x_ring_read(struct ft60x_ring_s *r, char *user_buffer, size_t
 			pnt += rlen;
 			r->rd->used += rlen;
 			r->rd->len -= rlen;
-			// rlen = 0;
+
+			/* 
+ 			 * if this node is now empty, reset it for later use
+			 * and jump to the next.
+			 */
+			if (r->rd->len == 0) {
+				r->rd->used = 0;
+				r->rd = r->rd->next;
+			}
+
 			return len;
 		}
 		r->rd = r->rd->next;
 	}
 	return len - rlen;
+}
+
+static int ft60x_ring_has_data(struct ft60x_ring_s *r)
+{
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+	printk("return %d\n", (r->rd->len > 0));
+
+	return (r->rd->len > 0);
 }
 
 void ft60x_ring_free(struct ft60x_ring_s *r)
@@ -373,34 +402,81 @@ static struct ft60x_endpoint* ft60x_find_endpoint(struct ft60x_data_dev *data_de
 	return NULL;
 }
 
+static int ft60x_endpoint_has_notification(struct ft60x_endpoint *ep)
+{
+	int notif;
+
+	/* Get the "Notification Message Feature" which tells if we receive
+	   an interruption via ctrl endpoint when message are available.
+	   This bit exist for each endpoint.
+	 */
+	notif = (ep->data_dev->ctrl_dev->ft60x_cfg.OptionalFeatureSupport >> ep->bulk_out_endpointAddr) & 1;
+
+	return notif;
+}
+
+static void ft60x_ctrlreq_callback(struct urb *urb)
+{
+	printk(KERN_INFO "%s called\n", __func__);
+
+	switch (urb->status) {
+	case 0:
+		/* nothing to do */
+		break;
+	case -ECONNRESET:
+	case -ENOENT:
+	case -ESHUTDOWN:
+		/* this urb is terminated, clean up */
+		printk(KERN_INFO "%s - urb shutting down with status: %d\n",
+		       __func__, urb->status);
+		break;
+	default:
+		printk(KERN_INFO "%s - nonzero urb status received: %d\n",
+		       __func__, urb->status);
+		break;
+	}
+}
+
 static void ft60x_int_callback(struct urb *urb)
 {
 	int retval;
 	struct ft60x_ctrl_dev *ctrl_dev;
 	struct ft60x_endpoint *ep;
 	struct ft60x_irqresp *resp;
-	int i;
 
 	printk(KERN_INFO "%s called\n", __func__);
 	ctrl_dev = urb->context;
 
 	switch (urb->status) {
 	case 0:
-		/* success */
-
+		/*
+ 		 * we received a notification about the IN data pipes that have
+		 * pending data, submit a read request on the matching endpoint
+		 */
 		resp = (struct ft60x_irqresp *)ctrl_dev->int_in_buffer;
-		printk(KERN_INFO "struct ft60x_irqresp\nidx: %d, ep: 0x%02x, len: %d, unk1: 0x%08x\n", resp->idx, resp->ep, resp->len, resp->unk1);
+		printk(KERN_INFO "struct ft60x_irqresp\nidx: %d, ep: 0x%02x, len: %d\n", resp->idx, resp->ep, resp->len);
 
 		ep = ft60x_find_endpoint(ctrl_dev->data_dev, resp->ep);
-		if (!ep) {
+		if (ep) {
+			/* 
+ 			 * this is just submitting a read request but not waiting,
+ 			 * fine to do it in callback context
+			 */
+			ft60x_do_data_read_io(ep, resp->len);
+			
+			spin_lock_irq(&ep->err_lock);
+			ep->waiting_notif = 0;
+			spin_unlock_irq(&ep->err_lock);
+
+			wake_up_interruptible(&ep->bulk_in_wait);
+
+		} else {
 			dev_err(&ctrl_dev->interface->dev,
 				"%s - could not find notified endpoint: 0x%02x\n",
 				__func__, resp->ep);
 			goto exit;
 		}
-
 		break;
-
 	case -ECONNRESET:
 	case -ENOENT:
 	case -ESHUTDOWN:
@@ -624,8 +700,8 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 	usb_set_intfdata(interface, ctrl_dev);
 
 	/* 
-	   Attemp to find the ctrl interface of this ctrl intf 
-	   Normally, the Control interface is enumerated before this one
+	   Attempt to find the data interface for this ctrl intf
+	   Normally, the Control interface is enumerated before data intf
 	   So this function should never find anything, but in case in the future
 	   the data interface shows up before, we can still match.
 	 */
@@ -696,11 +772,19 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 		}
 	}
 
+	/* 
+ 	 * The chip stores its current configuration on a internal EEPROM.
+	 * Get it now
+	 */
+
 	retval = ft60x_get_config(ctrl_dev);
 	if(retval)
 		goto error;
 	ft60x_print_config(&ctrl_dev->ft60x_cfg);
+
 	retval = ft60x_get_unknown(ctrl_dev);
+	if(retval)
+		goto error;
 
 	return retval;
 error:
@@ -942,11 +1026,12 @@ static int ft60x_data_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int ft60x_ctrl_req(struct ft60x_ctrl_dev *ctrl_dev)
+static int ft60x_send_ctrlreq(struct ft60x_ctrl_dev *ctrl_dev, bool asynchronous)
 {
-	int actual_len = 0;
-	u8 *b = NULL;
+	int len = 0;
+	u8 *buf = NULL;
 	int retval = 0;
+	struct urb *urb = NULL;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
@@ -955,37 +1040,64 @@ static int ft60x_ctrl_req(struct ft60x_ctrl_dev *ctrl_dev)
 		goto exit;
 	}
 
-	b = kmalloc(sizeof(struct ft60x_ctrlreq), GFP_KERNEL);
-	if (!b) {
+	buf = kmalloc(sizeof(struct ft60x_ctrlreq), GFP_KERNEL);
+	if (!buf) {
 		retval = -ENOMEM;
 		goto exit;
 	}
 
-	memcpy(b, &ctrl_dev->ctrlreq, sizeof(struct ft60x_ctrlreq));
+	memcpy(buf, &ctrl_dev->ctrlreq, sizeof(struct ft60x_ctrlreq));
 
-	retval = usb_bulk_msg(ctrl_dev->udev,
-			      usb_sndbulkpipe(ctrl_dev->udev, ctrl_dev->bulk_out_endpointAddr),
-			      b, sizeof(struct ft60x_ctrlreq), &actual_len, 1000);
-	if (retval) {
-		printk("%s: command bulk message failed: error %d\n",
-		       __func__, retval);
-		goto exit;
+	if (asynchronous) {
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (!urb) {
+			retval = -ENOMEM;
+			goto exit;
+		}
+
+		usb_fill_bulk_urb(urb, ctrl_dev->udev,
+				  usb_sndbulkpipe(ctrl_dev->udev,
+						  ctrl_dev->bulk_out_endpointAddr),
+				  buf, sizeof(struct ft60x_ctrlreq),
+				  ft60x_ctrlreq_callback, NULL);
+		/// XXX anchor urb
+
+		retval = usb_submit_urb(urb, GFP_KERNEL);
+		if (retval) {
+			dev_err(&ctrl_dev->interface->dev,
+				"%s - failed submitting ctrlreq urb, error %d\n",
+			       __func__, retval);
+			goto exit;
+		}
+	} else {
+		retval = usb_bulk_msg(ctrl_dev->udev,
+				      usb_sndbulkpipe(ctrl_dev->udev,
+						      ctrl_dev->bulk_out_endpointAddr),
+				      buf, sizeof(struct ft60x_ctrlreq),
+				      &len, 1000);
+		if (retval) {
+			printk("%s: command bulk message failed: error %d\n",
+			       __func__, retval);
+			goto exit;
+		}
 	}
 
 exit:
-	if (b) {
-		kfree(b);
+	if (urb) {
+		usb_free_urb(urb);
+	}
+	if (buf) {
+		kfree(buf);
 	}
 
-	printk(KERN_INFO "EXIT %s\n", __func__);
+	printk(KERN_INFO "EXIT from %s, async == %d\n", __func__, asynchronous);
 
 	return retval;
 }
 
-static int ft60x_send_cmd_read(struct ft60x_endpoint *ep, size_t count)
+static int ft60x_send_cmdread(struct ft60x_endpoint *ep, size_t reqlen, bool asynchronous)
 {
 	int retval = 0;
-	char notif;
 	struct ft60x_ctrlreq *req;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
@@ -995,23 +1107,14 @@ static int ft60x_send_cmd_read(struct ft60x_endpoint *ep, size_t count)
 		goto exit;
 	}
 
+	// XXX mutex this, maybe use data_dev io_mutex ??
 	req = &ep->data_dev->ctrl_dev->ctrlreq;
 	req->idx++;
-	req->pipe = ep->bulk_in_endpointAddr;
+	req->ep = ep->bulk_in_endpointAddr;
 	req->cmd = 1;
+	req->len = reqlen;
 
-	/* Get the "Notification Message Feature" which tells if we receive
-	   an interruption when message are available. This bit exist for each EP
-	 */
-	notif = (ep->data_dev->ctrl_dev->ft60x_cfg.OptionalFeatureSupport >> ep->bulk_out_endpointAddr) & 1;
-	if (notif) {
-		// XXX
-		// req->len = min(ep->bulk_in_size * 128, ep->len_to_read);
-	} else {
-		req->len = ep->bulk_in_size * 128;
-	}
-
-	retval = ft60x_ctrl_req(ep->data_dev->ctrl_dev);
+	retval = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, asynchronous);
 
 	// dev->sent_cmd_read = 1; // XXX
 	printk(KERN_INFO "EXIT %s\n", __func__);
@@ -1039,8 +1142,8 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 		ep->errors = urb->status;
 	} else {
 		/* update read length */
+		printk("update ring: %p: len: %d\n", ep->ring.wr, urb->actual_length);
 		ep->ring.wr->len = urb->actual_length;
-		ep->ring.wr->used = 0;
 	}
 
 	ep->ongoing_read = 0;
@@ -1053,59 +1156,49 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 {
 	int ret;
 	int rv = 0;
-	char notif;
-	int len;
+	int notif;
+	int readlen;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
-	/* Get the "Notification Message Feature" which tells if we receive
-	   an interruption when message are available. This bit exist for each EP
-	 */
-	notif = (ep->data_dev->ctrl_dev->ft60x_cfg.OptionalFeatureSupport >> ep->bulk_out_endpointAddr) & 1;
+	notif = ft60x_endpoint_has_notification(ep);
 	printk("NOTIF: %d\n", notif);
 
-	
+	/* 
+ 	 * when in notification mode,
+ 	 * we should not ask more than what is available
+	 */
 	if (notif) {
-		// XXX
-		// if ((ep->len_to_read > 0) && !dev->sent_cmd_read) {
-		// 	ft60x_send_cmd_read(dev, count);
-		// }
+		readlen = min(ep->bulk_in_size * 128, count);
 	} else {
-		ft60x_send_cmd_read(ep, count);
+		/* ignore count, read a full packet */
+		readlen = ep->bulk_in_size * 128;
 	}
 
-	/* Can't read now ! */
-	// XXX
-	/*
-	if (notif && (ep->len_to_read <= 0)) {
-
-		spin_lock_irq(&ep->err_lock);
-		ep->ongoing_read = 1;
-		ep->waiting_int = 1;
-		spin_unlock_irq(&ep->err_lock);
-		return rv;
+	/* 
+ 	 * we must inform the chip of how much data bytes we want to read.
+	 * when in notification mode, we are called from callback context
+	 * and thus sending the command asynchronously.
+	 */
+	if (notif) {
+		ft60x_send_cmdread(ep, readlen, 1);
+	} else {
+		ft60x_send_cmdread(ep, readlen, 0);
 	}
-	*/
 
-	/* get the next available node from the ring */
-	ret = ft60x_ring_add_elem(&ep->ring);
+	/* get the next empty node from the ring buffer */
+	ret = ft60x_ring_add_node(&ep->ring);
 	if (ret < 0) {
 		return ret;
 	}
 
-	printk(KERN_INFO "Ring add elem: using node %p\n", ep->ring.wr);
-
-	if (notif) {
-		// len = min(ep->bulk_in_size * 128, ep->len_to_read);
-	} else {
-		len = ep->bulk_in_size * 128;
-	}
+	printk(KERN_INFO "Ring add node: using node %p\n", ep->ring.wr);
 
 	usb_fill_bulk_urb(ep->bulk_in_urb,
 			  ep->data_dev->udev,
 			  usb_rcvbulkpipe(ep->data_dev->udev,
 					  ep->bulk_in_endpointAddr),
-			  ep->ring.wr->bulk_in_buffer, len,
+			  ep->ring.wr->bulk_in_buffer, readlen,
 			  ft60x_data_read_bulk_callback, ep);
 
 	printk(KERN_INFO "fill bulk in urb done %s\n", __func__);
@@ -1138,6 +1231,7 @@ static ssize_t ft60x_data_read(struct file *file, char *user_buffer, size_t coun
 	struct ft60x_endpoint *ep;
 	int rv;
 	bool ongoing_io;
+	bool waiting;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
@@ -1148,28 +1242,28 @@ static ssize_t ft60x_data_read(struct file *file, char *user_buffer, size_t coun
 		return 0;
 	
 	/* no concurrent readers */
-	
 	rv = mutex_lock_interruptible(&ep->io_rd_mutex);
 	if (rv < 0)
 		return rv;
-	
 
+	// XXX ? /* this lock makes sure we don't submit URBs to gone devices */
+	// XXX ? mutex_lock(&ep->data_dev->io_mutex);
 	/* disconnect() was called */
-	
 	if (!ep->data_dev->interface) {
 		rv = -ENODEV;
 		goto exit;
 	}
 
 	// ep->done_reading = 0; // XXX ?
-	/* if IO is under way, we must not touch things */
 
+	/* if IO is under way, we must not touch things */
 retry:
 	spin_lock_irq(&ep->err_lock);
 	ongoing_io = ep->ongoing_read;
+	waiting = ep->waiting_notif;
 	spin_unlock_irq(&ep->err_lock);
 
-	if (ongoing_io) {
+	if (ongoing_io || waiting) {
 		/* nonblocking IO shall not wait */
 		if (file->f_flags & O_NONBLOCK) {
 			rv = -EAGAIN;
@@ -1179,7 +1273,8 @@ retry:
 		 * IO may take forever
 		 * hence wait in an interruptible state
 		 */
-		rv = wait_event_interruptible(ep->bulk_in_wait, (!ep->ongoing_read));
+		rv = wait_event_interruptible(ep->bulk_in_wait,
+				(!ep->ongoing_read && !ep->waiting_notif));
 		if (rv < 0)
 			goto exit;
 	}
@@ -1199,7 +1294,7 @@ retry:
 	 * if the buffer is filled we may satisfy the read
 	 * else we need to start IO
 	 */
-	if (ep->ring.rd->len) {
+	if (ft60x_ring_has_data(&ep->ring)) {
 		/* data is available */
 		printk(KERN_INFO "data is available\n");
 		rv = ft60x_ring_read(&ep->ring, user_buffer, count);
@@ -1208,20 +1303,28 @@ retry:
 
 		/*
 		 * if we are asked for more than we have,
+		 * and we are not in notification mode,
 		 * we start IO but don't wait
 		 */
-		if (rv < count) {
+		if ((rv < count) && !ft60x_endpoint_has_notification(ep)) {
 			ft60x_do_data_read_io(ep, count - rv);
 		}
 	} else {
-		/* no data in the buffer */
+		/*
+ 		 * no data in the buffer,
+ 		 * start IO only when not in notification mode
+ 		 */
 		printk(KERN_INFO "no data in the buffer\n");
-		rv = ft60x_do_data_read_io(ep, count);
-
-		if (rv < 0)
-			goto exit;
-		else
-			goto retry;
+		if (!ft60x_endpoint_has_notification(ep)) {
+			rv = ft60x_do_data_read_io(ep, count);
+			if (rv < 0)
+				goto exit;
+		} else {
+			spin_lock_irq(&ep->err_lock);
+			ep->waiting_notif = 1;
+			spin_unlock_irq(&ep->err_lock);
+		}
+		goto retry;
 	}
 exit:
 	// ep->done_reading = 1; // XXX ?
@@ -1575,6 +1678,10 @@ static void ft60x_disconnect(struct usb_interface *interface)
 
 		kref_put(&data_dev->kref, ft60x_delete_data);
 	}
+
+	// XXX
+	// usb_kill_anchored_urbs(&dev->submitted);
+
 }
 
 static struct usb_driver ft60x_driver = {
