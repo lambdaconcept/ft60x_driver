@@ -28,8 +28,9 @@
 #define USB_FT600_PRODUCT_ID	0x601e
 
 #define FT60X_EP_PAIR_MAX       4
+#define FT60X_DEVICE_NAME       "ft60x"
+#define FT60X_NUM_DEVICES       256
 
-#define DEVICE_NAME             "ft60x"
 /* table of devices that work with this driver */
 static const struct usb_device_id ft60x_table[] = {
 	{USB_DEVICE(USB_FT60X_VENDOR_ID, USB_FT600_PRODUCT_ID)},
@@ -79,7 +80,8 @@ static LIST_HEAD(ft60x_data_list);
 static struct usb_driver ft60x_driver;
 static int ft60x_open(struct inode *inode, struct file *file);
 static int ft60x_data_open(struct inode *inode, struct file *file);
-static struct class*  class  = NULL; ///< The device-driver class struct pointer
+static struct class* class  = NULL; ///< The device-driver class struct pointer
+static dev_t devt; // Global variable for the first device number
 
 static const struct file_operations ft60x_fops = {
         .owner =        THIS_MODULE,
@@ -585,6 +587,7 @@ static int ft60x_add_device(struct ft60x_data_dev *data_dev, int minor, int idx)
     dev_t dev = MKDEV(data_dev->major, idx);
     int ret;
 	
+	/*
 	if(!class){
 		class = class_create(THIS_MODULE, "ft60x");
 		if (IS_ERR(class)){
@@ -593,6 +596,7 @@ static int ft60x_add_device(struct ft60x_data_dev *data_dev, int minor, int idx)
 		}
 		printk(KERN_INFO "EBBChar: device class registered correctly\n");
 	}
+	*/
 	
  
 	// Register the device driver
@@ -627,7 +631,6 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	struct ft60x_data_dev *data_dev=NULL;
 	struct ft60x_ctrl_dev *ctrl_dev=NULL;
 	struct usb_endpoint_descriptor *endpoint;
-    dev_t first;
 	int retval = -ENOMEM;
 	int i;
 	int ep_pair_num;
@@ -663,12 +666,18 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	// }
 	// printk(KERN_INFO "Rregistered correctly with major number %d\n", data_dev->major);
 
-    if ((retval = alloc_chrdev_region(&first, 0, FT60X_EP_PAIR_MAX, DEVICE_NAME)) < 0)
-	{
-	    printk(KERN_ALERT "failed to alloc region\n");
-		goto error;
-	}
-    data_dev->major = MAJOR(first);
+    /* Allocate a major number */
+	/*
+    if(MAJOR(first) == 0)
+    {
+        if ((retval = alloc_chrdev_region(&first, 0, 256, DEVICE_NAME)) < 0)
+	    {
+	        printk(KERN_ALERT "failed to alloc region\n");
+	    	goto error;
+	    }
+    }
+	*/
+    data_dev->major = MAJOR(devt);
 
 	/* Attemp to find the ctrl interface of this ctrl intf */
 	list_for_each_entry(ctrl_dev, &ft60x_ctrl_list, ctrl_list) {
@@ -945,7 +954,7 @@ static void ft60x_disconnect(struct usb_interface *interface)
 			}
 		}
 		
-		unregister_chrdev_region(data_dev->major, FT60X_EP_PAIR_MAX);
+		// unregister_chrdev_region(data_dev->major, FT60X_EP_PAIR_MAX);
 
 		list_del(&data_dev->data_list);
 
@@ -959,6 +968,7 @@ static void ft60x_disconnect(struct usb_interface *interface)
 	 *  will re-create it later if needed 
 	 */
 	
+	/*
 	list_for_each_entry(ctrl_dev, &ft60x_ctrl_list, ctrl_list) {
 		last=0;
 		break;
@@ -968,19 +978,18 @@ static void ft60x_disconnect(struct usb_interface *interface)
 		last=0;
 		break;
 	}
+	*/
 	
+	/*
 	if(last){
 		printk(KERN_INFO "YES WAS LAST\n");
 		class_unregister(class);
 		class_destroy(class);
 		class=NULL;
 	}
-	
+	*/
 	
 }
-
-
-
 
 static struct usb_driver ft60x_driver = {
         .name =         "ft60x",
@@ -994,10 +1003,50 @@ static struct usb_driver ft60x_driver = {
 	.supports_autosuspend = 1,
 };
 
+static int __init ft60x_init(void)
+{
+	int rc;
 
+	class = class_create(THIS_MODULE, FT60X_DEVICE_NAME);
+	if (IS_ERR(class)) {
+		pr_err("couldn't create class\n");
+		return PTR_ERR(class);
+	}
 
-module_usb_driver(ft60x_driver);
+	rc = alloc_chrdev_region(&devt, 0, FT60X_NUM_DEVICES, FT60X_DEVICE_NAME);
+	if (rc) {
+		pr_err("failed to allocate char dev region\n");
+		goto err_region;
+	}
 
+	rc = usb_register(&ft60x_driver);
+	if (rc) {
+		pr_err("failed to register usb driver\n");
+		goto err_usb;
+	}
+
+	return rc;
+
+err_usb:
+	unregister_chrdev_region(devt, FT60X_NUM_DEVICES);
+err_region:
+	class_destroy(class);
+	class = NULL;
+
+	return rc;
+}
+
+static void __exit ft60x_exit(void)
+{
+	usb_deregister(&ft60x_driver);
+	unregister_chrdev_region(devt, FT60X_NUM_DEVICES);
+	class_destroy(class);
+	class = NULL;
+}
+
+module_init(ft60x_init);
+module_exit(ft60x_exit);
+// module_usb_driver(ft60x_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ramtin Amin <ramtin@lambdaconcept.com>");
