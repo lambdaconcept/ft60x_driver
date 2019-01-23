@@ -69,7 +69,7 @@ struct ft60x_config {
 	/* Optional Feature Support */
 	u16 	OptionalFeatureSupport;
 	u8 	BatteryChargingGPIOConfig;
-	u8 	FlashEEPROMDetection;	/* Read-only */
+        u8 	FlashEEPROMDetection;	/* Read-only */
 	/* MSIO and GPIO Configuration */
 	u32 	MSIO_Control;
 	u32 	GPIO_Control;
@@ -84,25 +84,25 @@ static int ft60x_release(struct inode *inode, struct file *file);
 
 static int ft60x_data_open(struct inode *inode, struct file *file);
 static int ft60x_data_release(struct inode *inode, struct file *file);
-static ssize_t ft60x_data_read(struct file *file, char *buffer, size_t count,
+static ssize_t ft60x_data_read(struct file *file, char *user_buffer, size_t count,
 			       loff_t * ppos);
 static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 				size_t count, loff_t * ppos);
 
-static struct class* class = NULL; // The device-driver class struct pointer
-static dev_t devt; // Global variable for the first device number
+static struct class* class = NULL; /* The device-driver class struct pointer */
+static dev_t devt; /* Global variable for the first device number */
 static char ft60x_minors[FT60X_MAX_MINORS / FT60X_EP_PAIR_MAX];
 
 static const struct file_operations ft60x_fops = {
-	.owner =        THIS_MODULE,
-	.read =         NULL,
-	.write =        NULL,
-	.open =         ft60x_open,
-	.release =      ft60x_release,
-	.flush =        NULL,
-	.poll =         NULL,
-	.unlocked_ioctl =       NULL,
-	.llseek =       noop_llseek,
+	.owner =	THIS_MODULE,
+	.read =		NULL,
+	.write =	NULL,
+	.open =		ft60x_open,
+	.release =	ft60x_release,
+	.flush =	NULL,
+	.poll =		NULL,
+	.unlocked_ioctl =	NULL,
+	.llseek =	noop_llseek,
 };
 
 static const struct file_operations ft60x_data_fops = {
@@ -157,6 +157,13 @@ struct ft60x_ctrlreq {
 	u32 unk5;
 } __attribute__ ((packed));
 
+struct ft60x_irqresp {
+	u32 idx;
+	u16 ep;
+	u16 len;
+	u32 unk1;
+} __attribute__ ((packed));
+
 struct ft60x_node_s {
 	unsigned char           *bulk_in_buffer;
 	size_t                   len;
@@ -169,28 +176,14 @@ struct ft60x_ring_s {
 	struct ft60x_node_s      first;
 	struct ft60x_node_s     *wr;
 	struct ft60x_node_s     *rd;
+	size_t                   ep_size;
 };
 
-struct ft60x_ctrl_dev {
-	struct usb_device       *device;
-	struct usb_interface    *interface;
-	struct list_head         ctrl_list;
-	struct ft60x_data_dev   *data_dev;
-	u32                      devnum;
-	struct usb_device       *udev;                   /* the usb device for this device */
-	struct urb              *int_in_urb;             /* the urb to read data with */
-	size_t                   int_in_size;            /* the size of the receive buffer */
-	signed char             *int_in_buffer;          /* the buffer to receive int data */
-	dma_addr_t               int_in_data_dma;        /* the dma buffer to receive int data */
-	struct kref              kref;
-	struct ft60x_config      ft60x_cfg;
-	struct ft60x_ctrlreq	ctrlreq;
-};
 
 struct ft60x_endpoint {
 	int			used;			/* endpoint use depends on ft60x current config */
 	struct ft60x_ring_s	ring;			/* Our RING structure to add data in */
-	struct ft60x_data_dev	*data_dev;		/* pointer to parent data_dev */
+	struct ft60x_data_dev  *data_dev;		/* pointer to parent data_dev */
 	struct cdev		cdev;
 	atomic_t		opened;			/* restrict access to only one user */
 	struct semaphore	limit_sem;		/* limiting the number of writes in progress */
@@ -203,7 +196,10 @@ struct ft60x_endpoint {
 	bool			ongoing_read;		/* a read is going on */
 	int 			errors;			/* the last request tanked */
 	spinlock_t		err_lock;		/* lock for errors */
+	struct mutex		io_rd_mutex;		/* synchronize I/O with disconnect */
+	
 };
+
 
 struct ft60x_data_dev {
 	struct usb_device       *device;
@@ -220,48 +216,93 @@ struct ft60x_data_dev {
 	struct ft60x_endpoint	ep_pair[FT60X_EP_PAIR_MAX];	/* 4 different endpoint max */
 };
 
-static void ft60x_ring_add_elem(struct ft60x_ring_s *l)
+
+struct ft60x_ctrl_dev {
+	struct usb_device       *device;
+	struct usb_interface    *interface;
+	struct list_head         ctrl_list;
+	struct ft60x_data_dev   *data_dev;
+	u32                      devnum;
+	struct usb_device       *udev;                   /* the usb device for this device */
+	__u8			bulk_out_endpointAddr;	 /* the address of the bulk out endpoint */
+	struct urb              *int_in_urb;             /* the urb to read data with */
+	size_t                   int_in_size;            /* the size of the receive buffer */
+	signed char             *int_in_buffer;          /* the buffer to receive int data */
+	dma_addr_t               int_in_data_dma;        /* the dma buffer to receive int data */
+	struct kref              kref;
+	struct ft60x_config      ft60x_cfg;
+	struct ft60x_ctrlreq	 ctrlreq;
+	struct mutex		 io_mutex;		/* synchronize I/O with disconnect */
+};
+
+
+static int ft60x_ring_add_elem(struct ft60x_ring_s *l)
 {
 	struct ft60x_node_s *tmp;
 
+	/* use current node if available */
 	if (!l->wr->len) {
-		return;
+		return 0;
 	}
 
+	/* use next node is available */
 	if (!l->wr->next->len) {
 		l->wr = l->wr->next;
-		return;
+		return 0;
 	}
 
 	/* add a new node */
 	tmp = kmalloc(sizeof(struct ft60x_node_s), GFP_NOIO);
+	if (!tmp) {
+		return -ENOMEM;
+	}
 	memset(tmp, 0, sizeof(struct ft60x_node_s));
-	//TODO ALLOC COHERENT
+
+	tmp->bulk_in_buffer = kmalloc(l->ep_size, GFP_KERNEL);
+	if (!tmp->bulk_in_buffer) {
+		kfree(tmp);
+		return -ENOMEM;
+	}
+	
 	tmp->prev = l->wr;
 	tmp->next = l->wr->next;
 	l->wr->next->prev = tmp;
 	l->wr->next = tmp;
 	l->wr = tmp;
+
+	return 0;
 }
 
-static void ft60x_ring_init(struct ft60x_ring_s *r)
+static int ft60x_ring_init(struct ft60x_ring_s *r, size_t ep_size)
 {
 	memset(r, 0, sizeof(struct ft60x_ring_s));
+
 	r->first.next = &r->first;
 	r->first.prev = &r->first;
 	r->wr = &r->first;
 	r->rd = &r->first;
+	r->ep_size = ep_size;
+
+	/* allocate the first buffer in the ring */
+	r->first.bulk_in_buffer = kmalloc(r->ep_size, GFP_KERNEL);
+	if (!r->first.bulk_in_buffer) {
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
-static size_t ft60x_ring_read(struct ft60x_ring_s *r, char *buf, size_t len)
+static ssize_t ft60x_ring_read(struct ft60x_ring_s *r, char *user_buffer, size_t len)
 {
-	char *pnt = buf;
+	char *pnt = user_buffer;
 	size_t rlen = len;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
 	while(r->rd->len) {
+		printk(KERN_INFO "Ring read: using node %p, %ld, %ld\n", r->rd, r->rd->len, r->rd->used);
 		if(r->rd->len < rlen) {
+			/* we are asked for more than we have */
 			printk(KERN_INFO "copy_to_user 1\n");
 			if (copy_to_user(pnt,
 					 r->rd->bulk_in_buffer + r->rd->used,
@@ -276,6 +317,7 @@ static size_t ft60x_ring_read(struct ft60x_ring_s *r, char *buf, size_t len)
 			if(r->rd == r->wr)
 				return len - rlen;
 		} else {
+			/* enough data */
 			printk(KERN_INFO "copy_to_user 2\n");
 			if (copy_to_user(pnt,
 					 r->rd->bulk_in_buffer + r->rd->used,
@@ -314,13 +356,51 @@ void ft60x_ring_free(struct ft60x_ring_s *r)
 	}while(o != p);
 }
 
+static struct ft60x_endpoint* ft60x_find_endpoint(struct ft60x_data_dev *data_dev, u8 addr)
+{
+	int i;
+	struct ft60x_endpoint *ep;
+
+	for (i = 0; i < FT60X_EP_PAIR_MAX; i++) {
+		ep = &data_dev->ep_pair[i];
+		printk("FIND: %02x, %02x, %02x", addr, ep->bulk_in_endpointAddr, ep->bulk_out_endpointAddr);
+		if ((ep->bulk_in_endpointAddr == addr) ||
+		    (ep->bulk_out_endpointAddr == addr)) {
+			return ep;
+		}
+	}
+
+	return NULL;
+}
+
 static void ft60x_int_callback(struct urb *urb)
 {
 	int retval;
+	struct ft60x_ctrl_dev *ctrl_dev;
+	struct ft60x_endpoint *ep;
+	struct ft60x_irqresp *resp;
+	int i;
+
 	printk(KERN_INFO "%s called\n", __func__);
+	ctrl_dev = urb->context;
 
 	switch (urb->status) {
-	case 0:         /* success */
+	case 0:
+		/* success */
+
+		resp = (struct ft60x_irqresp *)ctrl_dev->int_in_buffer;
+		printk(KERN_INFO "struct ft60x_irqresp\nidx: %d, ep: 0x%02x, len: %d, unk1: 0x%08x\n", resp->idx, resp->ep, resp->len, resp->unk1);
+
+		ep = ft60x_find_endpoint(ctrl_dev->data_dev, resp->ep);
+		if (!ep) {
+			dev_err(&ctrl_dev->interface->dev,
+				"%s - could not find notified endpoint: 0x%02x\n",
+				__func__, resp->ep);
+			goto exit;
+		}
+
+		break;
+
 	case -ECONNRESET:
 	case -ENOENT:
 	case -ESHUTDOWN:
@@ -489,13 +569,12 @@ static void ft60x_delete_data(struct kref *kref)
 	struct ft60x_data_dev *data_dev = container_of(kref, struct ft60x_data_dev, kref);
 	int i;
 
+	printk(KERN_INFO "%s called\n", __func__);
+
 	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
-
 		if(data_dev->ep_pair[i].bulk_in_urb){
-			usb_free_urb(data_dev->ep_pair[i].bulk_in_urb);
+		  usb_free_urb(data_dev->ep_pair[i].bulk_in_urb);
 		}
-
-		ft60x_ring_free(&data_dev->ep_pair[i].ring);
 	}
 
 	kfree(data_dev);
@@ -506,8 +585,8 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 {
 	struct usb_device *device;
 	struct usb_host_interface *host_interface;
-	struct ft60x_ctrl_dev *ctrl_dev=NULL;
-	struct ft60x_data_dev *data_dev=NULL;
+	struct ft60x_ctrl_dev *ctrl_dev = NULL;
+	struct ft60x_data_dev *data_dev = NULL;
 	struct usb_endpoint_descriptor *endpoint;
 
 	int i;
@@ -539,6 +618,8 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 	ctrl_dev->interface = interface;
 	ctrl_dev->devnum = device->devnum;
 
+	mutex_init(&ctrl_dev->io_mutex);
+		
 	/* save our data pointer in this interface device */
 	usb_set_intfdata(interface, ctrl_dev);
 
@@ -560,58 +641,58 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 
 	for (i = 0; i < host_interface->desc.bNumEndpoints; ++i) {
 		endpoint = &host_interface->endpoint[i].desc;
-		
+
 		if (usb_endpoint_is_int_in(endpoint)) {
-			
+
 			/* we found a interrupt in endpoint */
-			
+
 			ctrl_dev->int_in_size = usb_endpoint_maxp(endpoint);
+			printk("ctrl_dev->int_in_size: %ld\n", ctrl_dev->int_in_size);
 			ctrl_dev->int_in_buffer = usb_alloc_coherent(
 				ctrl_dev->udev,
 				ctrl_dev->int_in_size,
 				GFP_ATOMIC,
 				&ctrl_dev->int_in_data_dma
 				);
-			
+
 			if (!ctrl_dev->int_in_buffer) {
 				retval = -ENOMEM;
 				goto error;
 			}
-			
+
 			ctrl_dev->int_in_urb = usb_alloc_urb(0, GFP_KERNEL);
 			if (!ctrl_dev->int_in_urb) {
 				retval = -ENOMEM;
 				goto error;
 			}
-			
+
 			/* get a handle to the interrupt data pipe */
 
 			pipe = usb_rcvintpipe(ctrl_dev->udev,
 					      endpoint->bEndpointAddress);
 
 			maxp = usb_maxpacket(ctrl_dev->udev, pipe, usb_pipeout(pipe));
-			
+
 			usb_fill_int_urb(ctrl_dev->int_in_urb, ctrl_dev->udev, pipe,
 					 ctrl_dev->int_in_buffer, maxp,
 					 ft60x_int_callback, ctrl_dev,
 					 endpoint->bInterval);
-			
+
 			ctrl_dev->int_in_urb->transfer_dma = ctrl_dev->int_in_data_dma;
 			ctrl_dev->int_in_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
 			/* register our interrupt URB with the USB system */
-			
+
 			if (usb_submit_urb(ctrl_dev->int_in_urb, GFP_KERNEL)) {
 				retval = -EIO;
 				goto error;
 			}
 		}
-		
+
 		if (usb_endpoint_is_bulk_out(endpoint)) {
 
 			/* we found a bulk out endpoint */
-
-			//dev->bulk_out_endpointAddr = endpoint->bEndpointAddress;
+			ctrl_dev->bulk_out_endpointAddr = endpoint->bEndpointAddress;
 		}
 	}
 
@@ -636,36 +717,46 @@ error:
 static int ft60x_add_device(struct ft60x_data_dev *data_dev, int minor, int idx)
 {
 	struct device* device = NULL;
-	dev_t newdev;
-	int ret;
+	dev_t newdevt;
+	int ret = 0;
 
-	// Register the device driver
-	newdev = MKDEV(data_dev->major, data_dev->baseminor + idx);
+	/* Create and add a new device */
+	newdevt = MKDEV(data_dev->major, data_dev->baseminor + idx);
 	printk(KERN_INFO "device_create: %d %d %d\n", data_dev->major, minor , idx);
 	printk(KERN_INFO "drvdata: %p\n", &data_dev->ep_pair[idx]);
-	device = device_create(class, NULL, newdev, NULL, "ft60x%d%c", minor, idx + 'a');
-	if (IS_ERR(device)){
-		printk(KERN_ALERT "Failed to create the device\n");
-		goto error;
+
+	device = device_create(class, NULL, newdevt, NULL, "ft60x%d%c", minor, idx + 'a');
+	if (IS_ERR(device)) {
+		ret = PTR_ERR(device);
+		dev_err(&data_dev->interface->dev,
+			"Error %d creating device for port %u\n",
+			ret, data_dev->baseminor + idx);
+		goto error_dev;
 	}
 
 	cdev_init(&data_dev->ep_pair[idx].cdev, &ft60x_data_fops);
-	if ((ret = cdev_add(&data_dev->ep_pair[idx].cdev, newdev, 1)) < 0) {
-		printk(KERN_ALERT "Failed to add the device\n");
-		return ret;
+	ret = cdev_add(&data_dev->ep_pair[idx].cdev, newdevt, 1);
+	if (ret < 0) {
+		dev_err(&data_dev->interface->dev,
+			"Error %d adding cdev for port %u\n",
+			ret, data_dev->baseminor + idx);
+		goto error_cdev;
 	}
-	
-	printk(KERN_INFO "EBBChar: device class created correctly\n"); // Made it! device was initialized
+
+	printk(KERN_INFO "device class created correctly\n");
 	return 0;
 
-error:
-	return -1;
+error_cdev:
+	device_destroy(class, newdevt);
+error_dev:
+	return ret;
 }
  
 static int ft60x_register_baseminor(void)
 {
 	int i;
 
+	/* Reserve a group of minors */
 	for (i=0; i<sizeof(ft60x_minors); i++) {
 		if (!ft60x_minors[i]) {
 			ft60x_minors[i] = 1;
@@ -689,14 +780,14 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 {
 	struct usb_device *device;
 	struct usb_host_interface *host_interface;
-	struct ft60x_data_dev *data_dev=NULL;
-	struct ft60x_ctrl_dev *ctrl_dev=NULL;
+	struct ft60x_data_dev *data_dev = NULL;
+	struct ft60x_ctrl_dev *ctrl_dev = NULL;
 	struct usb_endpoint_descriptor *endpoint;
 	struct ft60x_endpoint *p;
 	int retval;
 	int i;
 	int ep_pair_num;
-	
+
 	host_interface = interface->cur_altsetting;
 	device = interface_to_usbdev(interface);
 
@@ -719,6 +810,7 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 		sema_init(&p->limit_sem, WRITES_IN_FLIGHT);
 		spin_lock_init(&p->err_lock);
 		init_waitqueue_head(&p->bulk_in_wait);
+		mutex_init(&p->io_rd_mutex);
 	}
 
 	data_dev->device = device;
@@ -758,7 +850,7 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 			/* we found a bulk out endpoint */
 			p->bulk_out_endpointAddr = endpoint->bEndpointAddress;
 		}
-		
+
 		if (usb_endpoint_is_bulk_in(endpoint)) {
 
 			printk("BULK IN %d\n", i);
@@ -775,7 +867,6 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 				goto error;
 			}
 
-			ft60x_ring_init(&p->ring);
 		}
 	}
 
@@ -791,6 +882,7 @@ error:
 
 static int ft60x_data_open(struct inode *inode, struct file *file)
 {
+	int ret;
 	unsigned int mj = imajor(inode);
 	unsigned int mn = iminor(inode);
 	struct ft60x_endpoint *ep;
@@ -807,6 +899,12 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 		return -EBUSY;
 	}
 
+	/* Initialize RX Ring Structure */
+	ret = ft60x_ring_init(&ep->ring, ep->bulk_in_size);
+	if (ret < 0) {
+		goto error;
+	}
+	
 	/* increment our usage count for the device */
 	kref_get(&ep->data_dev->kref);
 
@@ -815,6 +913,10 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	printk(KERN_INFO "prvdata: %p\n", file->private_data);
 
 	return 0;
+
+error:
+	atomic_dec(&ep->opened);
+	return ret;
 }
 
 static int ft60x_data_release(struct inode *inode, struct file *file)
@@ -827,9 +929,15 @@ static int ft60x_data_release(struct inode *inode, struct file *file)
 	if (ep == NULL)
 		return -ENODEV;
 
-	atomic_dec(&ep->opened);
-
 	file->private_data = NULL;
+
+	/* Free Ring struture */
+	ft60x_ring_free(&ep->ring); // XXX maybe use after free if file is closed while ongoing read
+
+	/* decrement the count on our device */
+	kref_put(&ep->data_dev->kref, ft60x_delete_data);
+
+	atomic_dec(&ep->opened);
 
 	return 0;
 }
@@ -856,8 +964,8 @@ static int ft60x_ctrl_req(struct ft60x_ctrl_dev *ctrl_dev)
 	memcpy(b, &ctrl_dev->ctrlreq, sizeof(struct ft60x_ctrlreq));
 
 	retval = usb_bulk_msg(ctrl_dev->udev,
-			      usb_sndbulkpipe(ctrl_dev->udev, 1), b,
-			      sizeof(struct ft60x_ctrlreq), &actual_len, 1000);
+			      usb_sndbulkpipe(ctrl_dev->udev, ctrl_dev->bulk_out_endpointAddr),
+			      b, sizeof(struct ft60x_ctrlreq), &actual_len, 1000);
 	if (retval) {
 		printk("%s: command bulk message failed: error %d\n",
 		       __func__, retval);
@@ -887,12 +995,14 @@ static int ft60x_send_cmd_read(struct ft60x_endpoint *ep, size_t count)
 		goto exit;
 	}
 
-	// XXX concurent accesses ??
 	req = &ep->data_dev->ctrl_dev->ctrlreq;
 	req->idx++;
 	req->pipe = ep->bulk_in_endpointAddr;
 	req->cmd = 1;
 
+	/* Get the "Notification Message Feature" which tells if we receive
+	   an interruption when message are available. This bit exist for each EP
+	 */
 	notif = (ep->data_dev->ctrl_dev->ft60x_cfg.OptionalFeatureSupport >> ep->bulk_out_endpointAddr) & 1;
 	if (notif) {
 		// XXX
@@ -917,6 +1027,7 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 
 	ep = urb->context;
 	spin_lock(&ep->err_lock);
+
 	/* sync/async unlink faults aren't errors */
 	if (urb->status) {
 		if (!(urb->status == -ENOENT ||
@@ -926,9 +1037,12 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 				__func__, urb->status);
 
 		ep->errors = urb->status;
+	} else {
+		/* update read length */
+		ep->ring.wr->len = urb->actual_length;
+		ep->ring.wr->used = 0;
 	}
-	// dev->bulk_in_filled = urb->actual_length;
-	// dev->len_to_read -= urb->actual_length;
+
 	ep->ongoing_read = 0;
 	spin_unlock(&ep->err_lock);
 
@@ -937,14 +1051,20 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 
 static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 {
+	int ret;
 	int rv = 0;
 	char notif;
+	int len;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
-	/* If we are in notification mode */
+	/* Get the "Notification Message Feature" which tells if we receive
+	   an interruption when message are available. This bit exist for each EP
+	 */
 	notif = (ep->data_dev->ctrl_dev->ft60x_cfg.OptionalFeatureSupport >> ep->bulk_out_endpointAddr) & 1;
 	printk("NOTIF: %d\n", notif);
+
+	
 	if (notif) {
 		// XXX
 		// if ((ep->len_to_read > 0) && !dev->sent_cmd_read) {
@@ -968,37 +1088,25 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	*/
 
 	/* get the next available node from the ring */
-	ft60x_ring_add_elem(&ep->ring);
-
-	printk(KERN_INFO "RING %s\n", __func__);
-
-	/* allocate a buffer if necessary */
-	if (!ep->ring.wr->bulk_in_buffer) {
-		ep->ring.wr->bulk_in_buffer = kmalloc(ep->bulk_in_size, GFP_KERNEL);
-		if (!ep->ring.wr->bulk_in_buffer) {
-			return -ENOMEM;
-		}
+	ret = ft60x_ring_add_elem(&ep->ring);
+	if (ret < 0) {
+		return ret;
 	}
+
+	printk(KERN_INFO "Ring add elem: using node %p\n", ep->ring.wr);
 
 	if (notif) {
-		// XXX
-		// usb_fill_bulk_urb(ep->bulk_in_urb,
-		// 		  ep->data_dev->udev,
-		// 		  usb_rcvbulkpipe(ep->data_dev->udev,
-		// 				  ep->bulk_in_endpointAddr),
-		// 		  ep->ring.wr->bulk_in_buffer,
-		// 		  min(ep->bulk_in_size * 128,
-		// 		      ep->len_to_read),
-		// 		  ft60x_data_read_bulk_callback, ep);
+		// len = min(ep->bulk_in_size * 128, ep->len_to_read);
 	} else {
-		usb_fill_bulk_urb(ep->bulk_in_urb,
-				  ep->data_dev->udev,
-				  usb_rcvbulkpipe(ep->data_dev->udev,
-						  ep->bulk_in_endpointAddr),
-				  ep->ring.wr->bulk_in_buffer,
-				  ep->bulk_in_size * 128,
-				  ft60x_data_read_bulk_callback, ep);
+		len = ep->bulk_in_size * 128;
 	}
+
+	usb_fill_bulk_urb(ep->bulk_in_urb,
+			  ep->data_dev->udev,
+			  usb_rcvbulkpipe(ep->data_dev->udev,
+					  ep->bulk_in_endpointAddr),
+			  ep->ring.wr->bulk_in_buffer, len,
+			  ft60x_data_read_bulk_callback, ep);
 
 	printk(KERN_INFO "fill bulk in urb done %s\n", __func__);
 
@@ -1024,7 +1132,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	return rv;
 }
 
-static ssize_t ft60x_data_read(struct file *file, char *buffer, size_t count,
+static ssize_t ft60x_data_read(struct file *file, char *user_buffer, size_t count,
 			       loff_t * ppos)
 {
 	struct ft60x_endpoint *ep;
@@ -1034,19 +1142,21 @@ static ssize_t ft60x_data_read(struct file *file, char *buffer, size_t count,
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
 	ep = file->private_data;
-
+	
 	/* if we cannot read at all, return EOF */
-	if (!ep->bulk_in_urb || !count)
+	if (!ep || !ep->bulk_in_urb || !count)
 		return 0;
-
+	
 	/* no concurrent readers */
-	/* XXX
-	rv = mutex_lock_interruptible(&dev->io_mutex);
+	
+	rv = mutex_lock_interruptible(&ep->io_rd_mutex);
 	if (rv < 0)
 		return rv;
-	*/
+	
 
-	if (!ep->data_dev->interface) {	/* disconnect() was called */
+	/* disconnect() was called */
+	
+	if (!ep->data_dev->interface) {
 		rv = -ENODEV;
 		goto exit;
 	}
@@ -1092,7 +1202,7 @@ retry:
 	if (ep->ring.rd->len) {
 		/* data is available */
 		printk(KERN_INFO "data is available\n");
-		rv = ft60x_ring_read(&ep->ring, buffer, count);
+		rv = ft60x_ring_read(&ep->ring, user_buffer, count);
 		if (rv < 0)
 			goto exit;
 
@@ -1115,7 +1225,7 @@ retry:
 	}
 exit:
 	// ep->done_reading = 1; // XXX ?
-	// mutex_unlock(&dev->io_mutex); // XXX
+	mutex_unlock(&ep->io_rd_mutex);
 	return rv;
 }
 
@@ -1304,6 +1414,7 @@ static int ft60x_open(struct inode *inode, struct file *file)
         /* save our object in the file's private structure */
 	file->private_data = ctrl_dev;
 
+	/*
 	memcpy(&cstm, &ctrl_dev->ft60x_cfg, sizeof(struct ft60x_config));
 	cstm.FIFOMode=1;
 	cstm.ChannelConfig=0;
@@ -1311,6 +1422,7 @@ static int ft60x_open(struct inode *inode, struct file *file)
 	retval = ft60x_set_config(ctrl_dev, &cstm);
 
 	ft60x_print_config(&ctrl_dev->ft60x_cfg);
+	*/
 	return retval;
 exit:
 	printk(KERN_INFO "ERROR OPEN\n");
@@ -1426,8 +1538,14 @@ static void ft60x_disconnect(struct usb_interface *interface)
 		ctrl_dev = usb_get_intfdata(interface);
 		usb_set_intfdata(interface, NULL);
 
+		/* Give back our minor */
 		usb_deregister_dev(interface, &ft60x_class);
 
+		/* Prevent more I/O from starting */
+		mutex_lock(&ctrl_dev->io_mutex);
+		ctrl_dev->interface = NULL;
+		mutex_unlock(&ctrl_dev->io_mutex);
+		
 		list_del(&ctrl_dev->ctrl_list);
 
 		kref_put(&ctrl_dev->kref, ft60x_delete_ctrl);
@@ -1436,15 +1554,22 @@ static void ft60x_disconnect(struct usb_interface *interface)
 		/* data interface */
 
 		data_dev = usb_get_intfdata(interface);
+
 		usb_set_intfdata(interface, NULL);
 
 		for(i = 0; i < FT60X_EP_PAIR_MAX; i++) {
+			
 			if(data_dev->ep_pair[i].used) {
 				cdev_del(&data_dev->ep_pair[i].cdev);
 				device_destroy(class, MKDEV(data_dev->major, data_dev->baseminor + i));
 			}
 		}
 
+		/* Prevent more I/O from starting */
+		mutex_lock(&data_dev->io_mutex);
+		data_dev->interface = NULL;
+		mutex_unlock(&data_dev->io_mutex);
+			
 		ft60x_unregister_baseminor(data_dev->baseminor);
 		list_del(&data_dev->data_list);
 
