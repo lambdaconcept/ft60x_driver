@@ -84,6 +84,8 @@ static int ft60x_release(struct inode *inode, struct file *file);
 
 static int ft60x_data_open(struct inode *inode, struct file *file);
 static int ft60x_data_release(struct inode *inode, struct file *file);
+static ssize_t ft60x_data_read(struct file *file, char *buffer, size_t count,
+			       loff_t * ppos);
 static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 				size_t count, loff_t * ppos);
 
@@ -104,15 +106,15 @@ static const struct file_operations ft60x_fops = {
 };
 
 static const struct file_operations ft60x_data_fops = {
-	.owner =        THIS_MODULE,
-	.read =         NULL,
-	.write =        ft60x_data_write,
-	.open =         ft60x_data_open,
-	.release =      ft60x_data_release,
-	.flush =        NULL,
-	.poll =         NULL,
-	.unlocked_ioctl =       NULL,
-	.llseek =       noop_llseek,
+	.owner =	THIS_MODULE,
+	.read =		ft60x_data_read,
+	.write =	ft60x_data_write,
+	.open =		ft60x_data_open,
+	.release =	ft60x_data_release,
+	.flush =	NULL,
+	.poll =		NULL,
+	.unlocked_ioctl =	NULL,
+	.llseek =	noop_llseek,
 };
 
 static void ft60x_print_usb_log(struct usb_interface *intf,
@@ -144,6 +146,17 @@ static void ft60x_print_usb_log(struct usb_interface *intf,
         }
 }
 
+struct ft60x_ctrlreq {
+	u32 idx;
+	u8 pipe;
+	u8 cmd;
+	u8 unk1;
+	u8 unk2;
+	u32 len;
+	u32 unk4;
+	u32 unk5;
+} __attribute__ ((packed));
+
 struct ft60x_node_s {
 	unsigned char           *bulk_in_buffer;
 	size_t                   len;
@@ -171,6 +184,7 @@ struct ft60x_ctrl_dev {
 	dma_addr_t               int_in_data_dma;        /* the dma buffer to receive int data */
 	struct kref              kref;
 	struct ft60x_config      ft60x_cfg;
+	struct ft60x_ctrlreq	ctrlreq;
 };
 
 struct ft60x_endpoint {
@@ -182,8 +196,11 @@ struct ft60x_endpoint {
 	struct semaphore	limit_sem;		/* limiting the number of writes in progress */
 	size_t			bulk_in_size;
 	struct urb		*bulk_in_urb;		/* the urb to read data with */
+	wait_queue_head_t	bulk_in_wait;		/* to wait for an ongoing read */
+	__u8			bulk_in_endpointAddr;	/* the address of the bulk in endpoint */
 	__u8			bulk_out_endpointAddr;	/* the address of the bulk out endpoint */
 	bool 			busy_write;		/* for the writing poll */
+	bool			ongoing_read;		/* a read is going on */
 	int 			errors;			/* the last request tanked */
 	spinlock_t		err_lock;		/* lock for errors */
 };
@@ -206,16 +223,17 @@ struct ft60x_data_dev {
 static void ft60x_ring_add_elem(struct ft60x_ring_s *l)
 {
 	struct ft60x_node_s *tmp;
-	
-	if(!l->wr->len){
+
+	if (!l->wr->len) {
 		return;
 	}
-	
-	if(!l->wr->next->len){
+
+	if (!l->wr->next->len) {
 		l->wr = l->wr->next;
 		return;
-	} 
-	
+	}
+
+	/* add a new node */
 	tmp = kmalloc(sizeof(struct ft60x_node_s), GFP_NOIO);
 	memset(tmp, 0, sizeof(struct ft60x_node_s));
 	//TODO ALLOC COHERENT
@@ -228,41 +246,46 @@ static void ft60x_ring_add_elem(struct ft60x_ring_s *l)
 
 static void ft60x_ring_init(struct ft60x_ring_s *r)
 {
-	
 	memset(r, 0, sizeof(struct ft60x_ring_s));
 	r->first.next = &r->first;
 	r->first.prev = &r->first;
 	r->wr = &r->first;
 	r->rd = &r->first;
-	/*
-	  r->first.bulk_in_buffer = kmalloc(ep->bulk_in_size, GFP_KERNEL);
-	  if(!r->first.bulk_in_buffer) {
-	  return -ENOMEM;
-	  }
-	  return 0;
-	*/
 }
 
 static size_t ft60x_ring_read(struct ft60x_ring_s *r, char *buf, size_t len)
 {
 	char *pnt = buf;
-	size_t rlen=len;
-	
+	size_t rlen = len;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
 	while(r->rd->len) {
 		if(r->rd->len < rlen) {
-			memcpy(pnt, r->rd->bulk_in_buffer + r->rd->used, r->rd->len);
+			printk(KERN_INFO "copy_to_user 1\n");
+			if (copy_to_user(pnt,
+					 r->rd->bulk_in_buffer + r->rd->used,
+					 r->rd->len))
+				return -EFAULT;
+
 			pnt += r->rd->len;
 			rlen -= r->rd->len;
 			r->rd->len = 0;
 			r->rd->used = 0;
+
 			if(r->rd == r->wr)
 				return len - rlen;
 		} else {
-			memcpy(pnt, r->rd->bulk_in_buffer + r->rd->used, rlen);
+			printk(KERN_INFO "copy_to_user 2\n");
+			if (copy_to_user(pnt,
+					 r->rd->bulk_in_buffer + r->rd->used,
+					 rlen))
+				return -EFAULT;
+
 			pnt += rlen;
 			r->rd->used += rlen;
 			r->rd->len -= rlen;
-			rlen = 0;
+			// rlen = 0;
 			return len;
 		}
 		r->rd = r->rd->next;
@@ -277,19 +300,18 @@ void ft60x_ring_free(struct ft60x_ring_s *r)
 
 	if(!p->next)
 		return;
-	
+
 	do{
 		o = p->next;
 		p->next = o->next;
 		if(o->bulk_in_buffer){
 			kfree(o->bulk_in_buffer);
-			o->bulk_in_buffer=NULL;
+			o->bulk_in_buffer = NULL;
 		}
 		if(o != p){
 			kfree(o);
 		}
 	}while(o != p);
-	
 }
 
 static void ft60x_int_callback(struct urb *urb)
@@ -322,15 +344,13 @@ exit:
 
 static void ft60x_print_config(struct ft60x_config *cfg)
 {
-
 	printk(KERN_INFO "vendorid: %04x\n", cfg->VendorID);
 	printk(KERN_INFO "productid: %04x\n", cfg->ProductID);
 	printk(KERN_INFO "fifoclock: %02x\n", cfg->FIFOClock);
 	printk(KERN_INFO "fifomode: %02x\n", cfg->FIFOMode);
 	printk(KERN_INFO "channel: %02x\n", cfg->ChannelConfig);
-	printk(KERN_INFO "optionnal: %04x\n", cfg->OptionalFeatureSupport);
+	printk(KERN_INFO "optional: %04x\n", cfg->OptionalFeatureSupport);
 	printk(KERN_INFO "msiocontrol: %04x\n", cfg->MSIO_Control);
-
 }
 
 static int ft60x_set_config(struct ft60x_ctrl_dev *ctrl_dev,
@@ -468,13 +488,13 @@ static void ft60x_delete_data(struct kref *kref)
 {
 	struct ft60x_data_dev *data_dev = container_of(kref, struct ft60x_data_dev, kref);
 	int i;
-	
+
 	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
 
 		if(data_dev->ep_pair[i].bulk_in_urb){
 			usb_free_urb(data_dev->ep_pair[i].bulk_in_urb);
 		}
-		
+
 		ft60x_ring_free(&data_dev->ep_pair[i].ring);
 	}
 
@@ -672,6 +692,7 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	struct ft60x_data_dev *data_dev=NULL;
 	struct ft60x_ctrl_dev *ctrl_dev=NULL;
 	struct usb_endpoint_descriptor *endpoint;
+	struct ft60x_endpoint *p;
 	int retval;
 	int i;
 	int ep_pair_num;
@@ -691,10 +712,13 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	list_add_tail(&(data_dev->data_list), &(ft60x_data_list));
 
 	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
-		data_dev->ep_pair[i].data_dev = data_dev;
-		atomic_set(&data_dev->ep_pair[i].opened, 0);
-		sema_init(&data_dev->ep_pair[i].limit_sem, WRITES_IN_FLIGHT);
-		spin_lock_init(&data_dev->ep_pair[i].err_lock);
+		p = &data_dev->ep_pair[i];
+
+		p->data_dev = data_dev;
+		atomic_set(&p->opened, 0);
+		sema_init(&p->limit_sem, WRITES_IN_FLIGHT);
+		spin_lock_init(&p->err_lock);
+		init_waitqueue_head(&p->bulk_in_wait);
 	}
 
 	data_dev->device = device;
@@ -726,27 +750,32 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 
 		endpoint = &host_interface->endpoint[i].desc;
 		ep_pair_num =  i >> 1;
-		data_dev->ep_pair[ep_pair_num].used = 1;
+		p = &data_dev->ep_pair[ep_pair_num];
+		p->used = 1;
 
 		if (usb_endpoint_is_bulk_out(endpoint)) {
 			printk("BULK OUT %d\n", i);
 			/* we found a bulk out endpoint */
-			data_dev->ep_pair[ep_pair_num].bulk_out_endpointAddr = endpoint->bEndpointAddress;
+			p->bulk_out_endpointAddr = endpoint->bEndpointAddress;
 		}
 		
 		if (usb_endpoint_is_bulk_in(endpoint)) {
 
 			printk("BULK IN %d\n", i);
+			/* we found a bulk in endpoint */
 			ft60x_add_device(data_dev, data_dev->ctrl_dev->interface->minor, ep_pair_num);
 			// XXX check retval
 			printk(KERN_INFO "%d %d\n", data_dev->ctrl_dev->interface->minor, ep_pair_num);
 
-			data_dev->ep_pair[ep_pair_num].bulk_in_size = usb_endpoint_maxp(endpoint);
-			data_dev->ep_pair[ep_pair_num].bulk_in_urb = usb_alloc_urb(0, GFP_KERNEL);
-			if (!data_dev->ep_pair[ep_pair_num].bulk_in_urb) {
+			p->bulk_in_size = usb_endpoint_maxp(endpoint);
+			p->bulk_in_endpointAddr = endpoint->bEndpointAddress;
+			p->bulk_in_urb = usb_alloc_urb(0, GFP_KERNEL);
+			if (!p->bulk_in_urb) {
 				retval = -ENOMEM;
 				goto error;
 			}
+
+			ft60x_ring_init(&p->ring);
 		}
 	}
 
@@ -785,8 +814,6 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	file->private_data = ep;
 	printk(KERN_INFO "prvdata: %p\n", file->private_data);
 
-	ft60x_ring_init(&ep->ring);
-
 	return 0;
 }
 
@@ -807,9 +834,296 @@ static int ft60x_data_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int ft60x_ctrl_req(struct ft60x_ctrl_dev *ctrl_dev)
+{
+	int actual_len = 0;
+	u8 *b = NULL;
+	int retval = 0;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	if (!ctrl_dev) {
+		retval = -EINVAL;
+		goto exit;
+	}
+
+	b = kmalloc(sizeof(struct ft60x_ctrlreq), GFP_KERNEL);
+	if (!b) {
+		retval = -ENOMEM;
+		goto exit;
+	}
+
+	memcpy(b, &ctrl_dev->ctrlreq, sizeof(struct ft60x_ctrlreq));
+
+	retval = usb_bulk_msg(ctrl_dev->udev,
+			      usb_sndbulkpipe(ctrl_dev->udev, 1), b,
+			      sizeof(struct ft60x_ctrlreq), &actual_len, 1000);
+	if (retval) {
+		printk("%s: command bulk message failed: error %d\n",
+		       __func__, retval);
+		goto exit;
+	}
+
+exit:
+	if (b) {
+		kfree(b);
+	}
+
+	printk(KERN_INFO "EXIT %s\n", __func__);
+
+	return retval;
+}
+
+static int ft60x_send_cmd_read(struct ft60x_endpoint *ep, size_t count)
+{
+	int retval = 0;
+	char notif;
+	struct ft60x_ctrlreq *req;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	if (!ep) {
+		retval = -ENODEV;
+		goto exit;
+	}
+
+	// XXX concurent accesses ??
+	req = &ep->data_dev->ctrl_dev->ctrlreq;
+	req->idx++;
+	req->pipe = ep->bulk_in_endpointAddr;
+	req->cmd = 1;
+
+	notif = (ep->data_dev->ctrl_dev->ft60x_cfg.OptionalFeatureSupport >> ep->bulk_out_endpointAddr) & 1;
+	if (notif) {
+		// XXX
+		// req->len = min(ep->bulk_in_size * 128, ep->len_to_read);
+	} else {
+		req->len = ep->bulk_in_size * 128;
+	}
+
+	retval = ft60x_ctrl_req(ep->data_dev->ctrl_dev);
+
+	// dev->sent_cmd_read = 1; // XXX
+	printk(KERN_INFO "EXIT %s\n", __func__);
+exit:
+	return retval;
+}
+
+static void ft60x_data_read_bulk_callback(struct urb *urb)
+{
+	struct ft60x_endpoint *ep;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	ep = urb->context;
+	spin_lock(&ep->err_lock);
+	/* sync/async unlink faults aren't errors */
+	if (urb->status) {
+		if (!(urb->status == -ENOENT ||
+		      urb->status == -ECONNRESET || urb->status == -ESHUTDOWN))
+			dev_err(&ep->data_dev->interface->dev,
+				"%s - nonzero write bulk status received: %d\n",
+				__func__, urb->status);
+
+		ep->errors = urb->status;
+	}
+	// dev->bulk_in_filled = urb->actual_length;
+	// dev->len_to_read -= urb->actual_length;
+	ep->ongoing_read = 0;
+	spin_unlock(&ep->err_lock);
+
+	wake_up_interruptible(&ep->bulk_in_wait);
+}
+
+static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
+{
+	int rv = 0;
+	char notif;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	/* If we are in notification mode */
+	notif = (ep->data_dev->ctrl_dev->ft60x_cfg.OptionalFeatureSupport >> ep->bulk_out_endpointAddr) & 1;
+	printk("NOTIF: %d\n", notif);
+	if (notif) {
+		// XXX
+		// if ((ep->len_to_read > 0) && !dev->sent_cmd_read) {
+		// 	ft60x_send_cmd_read(dev, count);
+		// }
+	} else {
+		ft60x_send_cmd_read(ep, count);
+	}
+
+	/* Can't read now ! */
+	// XXX
+	/*
+	if (notif && (ep->len_to_read <= 0)) {
+
+		spin_lock_irq(&ep->err_lock);
+		ep->ongoing_read = 1;
+		ep->waiting_int = 1;
+		spin_unlock_irq(&ep->err_lock);
+		return rv;
+	}
+	*/
+
+	/* get the next available node from the ring */
+	ft60x_ring_add_elem(&ep->ring);
+
+	printk(KERN_INFO "RING %s\n", __func__);
+
+	/* allocate a buffer if necessary */
+	if (!ep->ring.wr->bulk_in_buffer) {
+		ep->ring.wr->bulk_in_buffer = kmalloc(ep->bulk_in_size, GFP_KERNEL);
+		if (!ep->ring.wr->bulk_in_buffer) {
+			return -ENOMEM;
+		}
+	}
+
+	if (notif) {
+		// XXX
+		// usb_fill_bulk_urb(ep->bulk_in_urb,
+		// 		  ep->data_dev->udev,
+		// 		  usb_rcvbulkpipe(ep->data_dev->udev,
+		// 				  ep->bulk_in_endpointAddr),
+		// 		  ep->ring.wr->bulk_in_buffer,
+		// 		  min(ep->bulk_in_size * 128,
+		// 		      ep->len_to_read),
+		// 		  ft60x_data_read_bulk_callback, ep);
+	} else {
+		usb_fill_bulk_urb(ep->bulk_in_urb,
+				  ep->data_dev->udev,
+				  usb_rcvbulkpipe(ep->data_dev->udev,
+						  ep->bulk_in_endpointAddr),
+				  ep->ring.wr->bulk_in_buffer,
+				  ep->bulk_in_size * 128,
+				  ft60x_data_read_bulk_callback, ep);
+	}
+
+	printk(KERN_INFO "fill bulk in urb done %s\n", __func__);
+
+	/* tell everybody to leave the URB alone */
+	spin_lock_irq(&ep->err_lock);
+	ep->ongoing_read = 1;
+	spin_unlock_irq(&ep->err_lock);
+
+	/* do it */
+	rv = usb_submit_urb(ep->bulk_in_urb, GFP_KERNEL);
+
+	printk(KERN_INFO "submitted ! %s\n", __func__);
+
+	if (rv < 0) {
+		dev_err(&ep->data_dev->interface->dev,
+			"%s - failed submitting read urb, error %d\n",
+			__func__, rv);
+		rv = (rv == -ENOMEM) ? rv : -EIO;
+		spin_lock_irq(&ep->err_lock);
+		ep->ongoing_read = 0;
+		spin_unlock_irq(&ep->err_lock);
+	}
+	return rv;
+}
+
+static ssize_t ft60x_data_read(struct file *file, char *buffer, size_t count,
+			       loff_t * ppos)
+{
+	struct ft60x_endpoint *ep;
+	int rv;
+	bool ongoing_io;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	ep = file->private_data;
+
+	/* if we cannot read at all, return EOF */
+	if (!ep->bulk_in_urb || !count)
+		return 0;
+
+	/* no concurrent readers */
+	/* XXX
+	rv = mutex_lock_interruptible(&dev->io_mutex);
+	if (rv < 0)
+		return rv;
+	*/
+
+	if (!ep->data_dev->interface) {	/* disconnect() was called */
+		rv = -ENODEV;
+		goto exit;
+	}
+
+	// ep->done_reading = 0; // XXX ?
+	/* if IO is under way, we must not touch things */
+
+retry:
+	spin_lock_irq(&ep->err_lock);
+	ongoing_io = ep->ongoing_read;
+	spin_unlock_irq(&ep->err_lock);
+
+	if (ongoing_io) {
+		/* nonblocking IO shall not wait */
+		if (file->f_flags & O_NONBLOCK) {
+			rv = -EAGAIN;
+			goto exit;
+		}
+		/*
+		 * IO may take forever
+		 * hence wait in an interruptible state
+		 */
+		rv = wait_event_interruptible(ep->bulk_in_wait, (!ep->ongoing_read));
+		if (rv < 0)
+			goto exit;
+	}
+
+	/* errors must be reported */
+	rv = ep->errors;
+	if (rv < 0) {
+		/* any error is reported once */
+		ep->errors = 0;
+		/* to preserve notifications about reset */
+		rv = (rv == -EPIPE) ? rv : -EIO;
+		/* report it */
+		goto exit;
+	}
+
+	/*
+	 * if the buffer is filled we may satisfy the read
+	 * else we need to start IO
+	 */
+	if (ep->ring.rd->len) {
+		/* data is available */
+		printk(KERN_INFO "data is available\n");
+		rv = ft60x_ring_read(&ep->ring, buffer, count);
+		if (rv < 0)
+			goto exit;
+
+		/*
+		 * if we are asked for more than we have,
+		 * we start IO but don't wait
+		 */
+		if (rv < count) {
+			ft60x_do_data_read_io(ep, count - rv);
+		}
+	} else {
+		/* no data in the buffer */
+		printk(KERN_INFO "no data in the buffer\n");
+		rv = ft60x_do_data_read_io(ep, count);
+
+		if (rv < 0)
+			goto exit;
+		else
+			goto retry;
+	}
+exit:
+	// ep->done_reading = 1; // XXX ?
+	// mutex_unlock(&dev->io_mutex); // XXX
+	return rv;
+}
+
 static void ft60x_data_write_bulk_callback(struct urb *urb)
 {
 	struct ft60x_endpoint *ep;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
 	ep = urb->context;
 
@@ -842,6 +1156,8 @@ static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 	struct urb *urb = NULL;
 	char *buf = NULL;
 	size_t writesize = min(count, (size_t) MAX_TRANSFER);
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
 	ep = file->private_data;
 
@@ -877,6 +1193,8 @@ static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 	if (retval < 0)
 		goto error;
 
+	printk(KERN_INFO "alloc %s\n", __func__);
+
 	/* create a urb, and a buffer for it, and copy the data to the urb */
 	urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!urb) {
@@ -904,6 +1222,8 @@ static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 		goto error;
 	}
 
+	printk(KERN_INFO "urb init %s\n", __func__);
+
 	/* initialize the urb properly */
 	usb_fill_bulk_urb(urb, ep->data_dev->udev,
 			  usb_sndbulkpipe(ep->data_dev->udev,
@@ -911,6 +1231,8 @@ static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 			  buf, writesize, ft60x_data_write_bulk_callback, ep);
 	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 	usb_anchor_urb(urb, &ep->data_dev->submitted);
+
+	printk(KERN_INFO "send urb %s\n", __func__);
 
 	/* send the data out the bulk port */
 	retval = usb_submit_urb(urb, GFP_KERNEL);
@@ -943,6 +1265,7 @@ error:
 	up(&ep->limit_sem);
 
 exit:
+	printk(KERN_INFO "error %s\n", __func__);
 	return retval;
 }
 
