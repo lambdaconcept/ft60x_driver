@@ -49,6 +49,7 @@ MODULE_DEVICE_TABLE(usb, ft60x_table);
 
 /* our private defines. if this grows any larger, use your own .h file */
 #define MAX_TRANSFER		2048
+#define WRITES_IN_FLIGHT	8
 
 struct ft60x_config {
 	/* Device Descriptor */
@@ -83,6 +84,8 @@ static int ft60x_release(struct inode *inode, struct file *file);
 
 static int ft60x_data_open(struct inode *inode, struct file *file);
 static int ft60x_data_release(struct inode *inode, struct file *file);
+static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
+				size_t count, loff_t * ppos);
 
 static struct class* class = NULL; // The device-driver class struct pointer
 static dev_t devt; // Global variable for the first device number
@@ -103,7 +106,7 @@ static const struct file_operations ft60x_fops = {
 static const struct file_operations ft60x_data_fops = {
 	.owner =        THIS_MODULE,
 	.read =         NULL,
-	.write =        NULL,
+	.write =        ft60x_data_write,
 	.open =         ft60x_data_open,
 	.release =      ft60x_data_release,
 	.flush =        NULL,
@@ -161,9 +164,7 @@ struct ft60x_ctrl_dev {
 	struct list_head         ctrl_list;
 	struct ft60x_data_dev   *data_dev;
 	u32                      devnum;
-
 	struct usb_device       *udev;                   /* the usb device for this device */
-
 	struct urb              *int_in_urb;             /* the urb to read data with */
 	size_t                   int_in_size;            /* the size of the receive buffer */
 	signed char             *int_in_buffer;          /* the buffer to receive int data */
@@ -173,26 +174,33 @@ struct ft60x_ctrl_dev {
 };
 
 struct ft60x_endpoint {
-	int                      used;
-	size_t                   bulk_in_size;
-	struct urb              *bulk_in_urb;            /* the urb to read data with */
-	struct ft60x_ring_s      ring;                   /* Our RING structure to add data in */
-	struct ft60x_data_dev   *data_dev;
-	struct cdev              cdev;
-	atomic_t                 opened;
+	int			used;			/* endpoint use depends on ft60x current config */
+	struct ft60x_ring_s	ring;			/* Our RING structure to add data in */
+	struct ft60x_data_dev	*data_dev;		/* pointer to parent data_dev */
+	struct cdev		cdev;
+	atomic_t		opened;			/* restrict access to only one user */
+	struct semaphore	limit_sem;		/* limiting the number of writes in progress */
+	size_t			bulk_in_size;
+	struct urb		*bulk_in_urb;		/* the urb to read data with */
+	__u8			bulk_out_endpointAddr;	/* the address of the bulk out endpoint */
+	bool 			busy_write;		/* for the writing poll */
+	int 			errors;			/* the last request tanked */
+	spinlock_t		err_lock;		/* lock for errors */
 };
 
 struct ft60x_data_dev {
 	struct usb_device       *device;
 	struct usb_interface    *interface;
-	struct ft60x_ctrl_dev   *ctrl_dev;
 	struct list_head         data_list;
+	struct ft60x_ctrl_dev   *ctrl_dev;
 	u32                      devnum;
 	struct usb_device       *udev;                  /* the usb device for this device */
-	int                      major;                 /* Major of the chardev */
-	int                      baseminor;             /* First minor in the data ep group */
-	struct kref              kref;
-	struct ft60x_endpoint    ep_pair[FT60X_EP_PAIR_MAX];                 /* 4 different endpoint max */
+	struct usb_anchor 	submitted;		/* in case we need to retract our submissions */
+	int			major;			/* major of the data chardev */
+	int			baseminor;		/* first minor in the data ep group */
+	struct kref		kref;
+	struct mutex		io_mutex;		/* synchronize I/O with disconnect */
+	struct ft60x_endpoint	ep_pair[FT60X_EP_PAIR_MAX];	/* 4 different endpoint max */
 };
 
 static void ft60x_ring_add_elem(struct ft60x_ring_s *l)
@@ -677,12 +685,16 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 		return -ENOMEM;
 
 	kref_init(&data_dev->kref);
+	mutex_init(&data_dev->io_mutex);
+	init_usb_anchor(&data_dev->submitted);
 
 	list_add_tail(&(data_dev->data_list), &(ft60x_data_list));
 
 	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
 		data_dev->ep_pair[i].data_dev = data_dev;
 		atomic_set(&data_dev->ep_pair[i].opened, 0);
+		sema_init(&data_dev->ep_pair[i].limit_sem, WRITES_IN_FLIGHT);
+		spin_lock_init(&data_dev->ep_pair[i].err_lock);
 	}
 
 	data_dev->device = device;
@@ -716,12 +728,13 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 		ep_pair_num =  i >> 1;
 		data_dev->ep_pair[ep_pair_num].used = 1;
 
-		if(usb_endpoint_is_bulk_out(endpoint)){
-
+		if (usb_endpoint_is_bulk_out(endpoint)) {
 			printk("BULK OUT %d\n", i);
+			/* we found a bulk out endpoint */
+			data_dev->ep_pair[ep_pair_num].bulk_out_endpointAddr = endpoint->bEndpointAddress;
 		}
 		
-		if(usb_endpoint_is_bulk_in(endpoint)){
+		if (usb_endpoint_is_bulk_in(endpoint)) {
 
 			printk("BULK IN %d\n", i);
 			ft60x_add_device(data_dev, data_dev->ctrl_dev->interface->minor, ep_pair_num);
@@ -792,6 +805,145 @@ static int ft60x_data_release(struct inode *inode, struct file *file)
 	file->private_data = NULL;
 
 	return 0;
+}
+
+static void ft60x_data_write_bulk_callback(struct urb *urb)
+{
+	struct ft60x_endpoint *ep;
+
+	ep = urb->context;
+
+	/* sync/async unlink faults aren't errors */
+	if (urb->status) {
+		if (!(urb->status == -ENOENT ||
+		      urb->status == -ECONNRESET || urb->status == -ESHUTDOWN))
+			dev_err(&ep->data_dev->interface->dev,
+				"%s - nonzero write bulk status received: %d\n",
+				__func__, urb->status);
+
+		spin_lock(&ep->err_lock);
+		ep->busy_write = 0;
+		ep->errors = urb->status;
+		spin_unlock(&ep->err_lock);
+		// wake_up_interruptible(&dev->bulk_out_wait);
+	}
+
+	/* free up our allocated buffer */
+	usb_free_coherent(urb->dev, urb->transfer_buffer_length,
+			  urb->transfer_buffer, urb->transfer_dma);
+	up(&ep->limit_sem);
+}
+
+static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
+				size_t count, loff_t * ppos)
+{
+	struct ft60x_endpoint *ep;
+	int retval = 0;
+	struct urb *urb = NULL;
+	char *buf = NULL;
+	size_t writesize = min(count, (size_t) MAX_TRANSFER);
+
+	ep = file->private_data;
+
+	/* verify that we actually have some data to write */
+	if (count == 0)
+		goto exit;
+
+	/*
+	 * limit the number of URBs in flight to stop a user from using up all
+	 * RAM
+	 */
+	if (!(file->f_flags & O_NONBLOCK)) {
+		if (down_interruptible(&ep->limit_sem)) {
+			retval = -ERESTARTSYS;
+			goto exit;
+		}
+	} else {
+		if (down_trylock(&ep->limit_sem)) {
+			retval = -EAGAIN;
+			goto exit;
+		}
+	}
+
+	spin_lock_irq(&ep->err_lock);
+	retval = ep->errors;
+	if (retval < 0) {
+		/* any error is reported once */
+		ep->errors = 0;
+		/* to preserve notifications a bout reset */
+		retval = (retval == -EPIPE) ? retval : -EIO;
+	}
+	spin_unlock_irq(&ep->err_lock);
+	if (retval < 0)
+		goto error;
+
+	/* create a urb, and a buffer for it, and copy the data to the urb */
+	urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!urb) {
+		retval = -ENOMEM;
+		goto error;
+	}
+
+	buf = usb_alloc_coherent(ep->data_dev->udev, writesize, GFP_KERNEL,
+				 &urb->transfer_dma);
+	if (!buf) {
+		retval = -ENOMEM;
+		goto error;
+	}
+
+	if (copy_from_user(buf, user_buffer, writesize)) {
+		retval = -EFAULT;
+		goto error;
+	}
+
+	/* this lock makes sure we don't submit URBs to gone devices */
+	mutex_lock(&ep->data_dev->io_mutex);
+	if (!ep->data_dev->interface) {	/* disconnect() was called */
+		mutex_unlock(&ep->data_dev->io_mutex);
+		retval = -ENODEV;
+		goto error;
+	}
+
+	/* initialize the urb properly */
+	usb_fill_bulk_urb(urb, ep->data_dev->udev,
+			  usb_sndbulkpipe(ep->data_dev->udev,
+					  ep->bulk_out_endpointAddr),
+			  buf, writesize, ft60x_data_write_bulk_callback, ep);
+	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	usb_anchor_urb(urb, &ep->data_dev->submitted);
+
+	/* send the data out the bulk port */
+	retval = usb_submit_urb(urb, GFP_KERNEL);
+	mutex_unlock(&ep->data_dev->io_mutex);
+	if (retval) {
+		dev_err(&ep->data_dev->interface->dev,
+			"%s - failed submitting write urb, error %d\n",
+			__func__, retval);
+		goto error_unanchor;
+	}
+	spin_lock_irq(&ep->err_lock);
+	ep->busy_write = 1;
+	spin_unlock_irq(&ep->err_lock);
+
+	/*
+	 * release our reference to this urb, the USB core will eventually free
+	 * it entirely
+	 */
+	usb_free_urb(urb);
+
+	return writesize;
+
+error_unanchor:
+	usb_unanchor_urb(urb);
+error:
+	if (urb) {
+		usb_free_coherent(ep->data_dev->udev, writesize, buf, urb->transfer_dma);
+		usb_free_urb(urb);
+	}
+	up(&ep->limit_sem);
+
+exit:
+	return retval;
 }
 
 static int ft60x_open(struct inode *inode, struct file *file)
