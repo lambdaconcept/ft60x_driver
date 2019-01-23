@@ -77,8 +77,12 @@ struct ft60x_config {
 static LIST_HEAD(ft60x_ctrl_list);
 static LIST_HEAD(ft60x_data_list);
 static struct usb_driver ft60x_driver;
+
 static int ft60x_open(struct inode *inode, struct file *file);
+static int ft60x_release(struct inode *inode, struct file *file);
+
 static int ft60x_data_open(struct inode *inode, struct file *file);
+static int ft60x_data_release(struct inode *inode, struct file *file);
 
 static struct class* class = NULL; // The device-driver class struct pointer
 static dev_t devt; // Global variable for the first device number
@@ -89,7 +93,7 @@ static const struct file_operations ft60x_fops = {
 	.read =         NULL,
 	.write =        NULL,
 	.open =         ft60x_open,
-	.release =      NULL,
+	.release =      ft60x_release,
 	.flush =        NULL,
 	.poll =         NULL,
 	.unlocked_ioctl =       NULL,
@@ -101,7 +105,7 @@ static const struct file_operations ft60x_data_fops = {
 	.read =         NULL,
 	.write =        NULL,
 	.open =         ft60x_data_open,
-	.release =      NULL,
+	.release =      ft60x_data_release,
 	.flush =        NULL,
 	.poll =         NULL,
 	.unlocked_ioctl =       NULL,
@@ -164,9 +168,7 @@ struct ft60x_ctrl_dev {
 	size_t                   int_in_size;            /* the size of the receive buffer */
 	signed char             *int_in_buffer;          /* the buffer to receive int data */
 	dma_addr_t               int_in_data_dma;        /* the dma buffer to receive int data */
-
 	struct kref              kref;
-
 	struct ft60x_config      ft60x_cfg;
 };
 
@@ -177,6 +179,7 @@ struct ft60x_endpoint {
 	struct ft60x_ring_s      ring;                   /* Our RING structure to add data in */
 	struct ft60x_data_dev   *data_dev;
 	struct cdev              cdev;
+	atomic_t                 opened;
 };
 
 struct ft60x_data_dev {
@@ -186,7 +189,6 @@ struct ft60x_data_dev {
 	struct list_head         data_list;
 	u32                      devnum;
 	struct usb_device       *udev;                  /* the usb device for this device */
-	
 	int                      major;                 /* Major of the chardev */
 	int                      baseminor;             /* First minor in the data ep group */
 	struct kref              kref;
@@ -405,8 +407,9 @@ exit:
 
 static int ft60x_get_unknown(struct ft60x_ctrl_dev *ctrl_dev)
 {
-        int retval;
+        int retval=0;
         int ret;
+
 	unsigned int *val = NULL;
 
 	if (!ctrl_dev) {
@@ -436,6 +439,40 @@ exit:
         return retval;
 }
 
+static void ft60x_delete_ctrl(struct kref *kref)
+{
+	struct ft60x_ctrl_dev *ctrl_dev = container_of(kref, struct ft60x_ctrl_dev, kref);
+
+	if(ctrl_dev->int_in_buffer){
+		usb_free_coherent(
+			ctrl_dev->udev,
+			ctrl_dev->int_in_size,
+			ctrl_dev->int_in_buffer,
+			ctrl_dev->int_in_data_dma
+			);
+	}
+	// XXX free int_in_urb
+
+	kfree(ctrl_dev);
+}
+
+static void ft60x_delete_data(struct kref *kref)
+{
+	struct ft60x_data_dev *data_dev = container_of(kref, struct ft60x_data_dev, kref);
+	int i;
+	
+	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
+
+		if(data_dev->ep_pair[i].bulk_in_urb){
+			usb_free_urb(data_dev->ep_pair[i].bulk_in_urb);
+		}
+		
+		ft60x_ring_free(&data_dev->ep_pair[i].ring);
+	}
+
+	kfree(data_dev);
+}
+
 static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 					 const struct usb_device_id *id)
 {
@@ -447,14 +484,11 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 
 	int i;
 	int maxp, pipe;
-	int retval = -ENOMEM;
+	int retval;
 
-	if(!interface && !id){
-		retval = -EINVAL;
-		goto error;
-	}
+	if(!interface && !id)
+		return -EINVAL;
 
-	
 	host_interface = interface->cur_altsetting;
 	device = interface_to_usbdev(interface);
 
@@ -462,18 +496,22 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 
 	ctrl_dev = kzalloc(sizeof(struct ft60x_ctrl_dev), GFP_KERNEL);
 	if (!ctrl_dev)
-		goto error;
+		return -ENOMEM;
+
+	kref_init(&ctrl_dev->kref);
 
 	/*
 	  We place the device in a list, in order to match the data interface later on
 	 */
 
 	list_add_tail(&(ctrl_dev->ctrl_list), &(ft60x_ctrl_list));
+
 	ctrl_dev->device = device;
 	ctrl_dev->udev = usb_get_dev(device);
 	ctrl_dev->interface = interface;
-	ctrl_dev->devnum = device->devnum;	
-	kref_init(&ctrl_dev->kref);
+	ctrl_dev->devnum = device->devnum;
+
+	/* save our data pointer in this interface device */
 	usb_set_intfdata(interface, ctrl_dev);
 
 	/* 
@@ -547,9 +585,8 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 
 			//dev->bulk_out_endpointAddr = endpoint->bEndpointAddress;
 		}
-		
 	}
-	
+
 	retval = ft60x_get_config(ctrl_dev);
 	if(retval)
 		goto error;
@@ -559,9 +596,12 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 	return retval;
 error:
 	printk(KERN_INFO "ERRROOOOOOOOOR\n");
-	if(ctrl_dev){
-		kfree(ctrl_dev);
-	}
+
+	list_del(&ctrl_dev->ctrl_list);
+
+	/* this frees allocated memory */
+	kref_put(&ctrl_dev->kref, ft60x_delete_ctrl);
+
 	return retval;
 }
 
@@ -624,7 +664,7 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	struct ft60x_data_dev *data_dev=NULL;
 	struct ft60x_ctrl_dev *ctrl_dev=NULL;
 	struct usb_endpoint_descriptor *endpoint;
-	int retval = -ENOMEM;
+	int retval;
 	int i;
 	int ep_pair_num;
 	
@@ -634,12 +674,15 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	/* allocate memory for our device state and initialize it */
 	data_dev = kzalloc(sizeof(struct ft60x_data_dev), GFP_KERNEL);
 	if (!data_dev)
-		goto error;
+		return -ENOMEM;
+
+	kref_init(&data_dev->kref);
 
 	list_add_tail(&(data_dev->data_list), &(ft60x_data_list));
 
 	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
 		data_dev->ep_pair[i].data_dev = data_dev;
+		atomic_set(&data_dev->ep_pair[i].opened, 0);
 	}
 
 	data_dev->device = device;
@@ -654,8 +697,7 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 		goto error;
 	}
 
-	kref_init(&data_dev->kref);
-
+	/* save our data pointer in this interface device */
 	usb_set_intfdata(interface, data_dev);
 	
 	/* Attemp to find the ctrl interface of this ctrl intf */
@@ -677,13 +719,13 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 		if(usb_endpoint_is_bulk_out(endpoint)){
 
 			printk("BULK OUT %d\n", i);
-			
 		}
 		
 		if(usb_endpoint_is_bulk_in(endpoint)){
 
 			printk("BULK IN %d\n", i);
 			ft60x_add_device(data_dev, data_dev->ctrl_dev->interface->minor, ep_pair_num);
+			// XXX check retval
 			printk(KERN_INFO "%d %d\n", data_dev->ctrl_dev->interface->minor, ep_pair_num);
 
 			data_dev->ep_pair[ep_pair_num].bulk_in_size = usb_endpoint_maxp(endpoint);
@@ -692,23 +734,16 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 				retval = -ENOMEM;
 				goto error;
 			}
-
 		}
-		
 	}
-	
+
 	return 0;
 error:
-	printk(KERN_INFO "ERROR ALLOC\n");
-	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
-		if(data_dev->ep_pair[i].bulk_in_urb){
-			usb_free_urb(data_dev->ep_pair[i].bulk_in_urb);
-		}
-	}
-	if(data_dev){
-		kfree(data_dev);
-	}
-		
+	list_del(&data_dev->data_list);
+
+	/* this frees allocated memory */
+	kref_put(&data_dev->kref, ft60x_delete_data);
+
 	return retval;
 }
 
@@ -717,21 +752,50 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	unsigned int mj = imajor(inode);
 	unsigned int mn = iminor(inode);
 	struct ft60x_endpoint *ep;
+	int opened;
 
 	printk(KERN_INFO "%s called\n", __func__);
 	printk(KERN_INFO "major: %i, minor: %i\n", mj, mn);
 
 	ep = container_of(inode->i_cdev, struct ft60x_endpoint, cdev);
 
+	/* Restrict access to only one instance */
+	opened = atomic_cmpxchg(&ep->opened, 0, 1);
+	if (opened) {
+		return -EBUSY;
+	}
+
+	/* increment our usage count for the device */
+	kref_get(&ep->data_dev->kref);
+
+        /* save our object in the file's private structure */
 	file->private_data = ep;
 	printk(KERN_INFO "prvdata: %p\n", file->private_data);
+
+	ft60x_ring_init(&ep->ring);
+
+	return 0;
+}
+
+static int ft60x_data_release(struct inode *inode, struct file *file)
+{
+	struct ft60x_endpoint *ep;
+
+	printk(KERN_INFO "%s called\n", __func__);
+
+	ep = file->private_data;
+	if (ep == NULL)
+		return -ENODEV;
+
+	atomic_dec(&ep->opened);
+
+	file->private_data = NULL;
 
 	return 0;
 }
 
 static int ft60x_open(struct inode *inode, struct file *file)
 {
-
 	struct usb_interface *interface;
 	int subminor;
         int retval = 0;
@@ -760,15 +824,14 @@ static int ft60x_open(struct inode *inode, struct file *file)
                 goto exit;
 
 	/* increment our usage count for the device */
-	//kref_get(&dev->kref);
+	kref_get(&ctrl_dev->kref);
 
         /* save our object in the file's private structure */
-	//file->private_data = dev;
-	
+	file->private_data = ctrl_dev;
 
 	memcpy(&cstm, &ctrl_dev->ft60x_cfg, sizeof(struct ft60x_config));
 	cstm.FIFOMode=1;
-	cstm.ChannelConfig=0; // XXX 0
+	cstm.ChannelConfig=0;
 	
 	retval = ft60x_set_config(ctrl_dev, &cstm);
 
@@ -777,9 +840,20 @@ static int ft60x_open(struct inode *inode, struct file *file)
 exit:
 	printk(KERN_INFO "ERROR OPEN\n");
 	return retval;
-
 }
 
+static int ft60x_release(struct inode *inode, struct file *file)
+{
+	struct ft60x_ctrl_dev *ctrl_dev;
+
+	ctrl_dev = file->private_data;
+	if (ctrl_dev == NULL)
+		return -ENODEV;
+
+	/* decrement the count on our device */
+	kref_put(&ctrl_dev->kref, ft60x_delete_ctrl);
+	return 0;
+}
 
 /*                                                                           
  * usb class driver info in order to get a minor number from the usb core,   
@@ -791,16 +865,13 @@ static struct usb_class_driver ft60x_class = {
 	.minor_base = USB_FT60X_MINOR_BASE,
 };
 
-
 static int ft60x_probe(struct usb_interface *interface,
 		       const struct usb_device_id *id)
 {
-	
 	struct usb_device *device;
 	struct usb_host_interface *host_interface;
 
-	int retval = -ENOMEM;
-	
+	int retval;
 	
 	host_interface = interface->cur_altsetting;
 	
@@ -808,7 +879,7 @@ static int ft60x_probe(struct usb_interface *interface,
 	device = interface_to_usbdev(interface);
 
 	/*
-	 * At this point, each FT60x is probed twice. 
+	 * At this point, each FT60x is probed twice.
 	 * Once for an interface with a bulkout EP for ctrl and INT EP for data notification
 	 * Another time for an interface with 1 to 4 EP depending on the configuration of FT60x
 	 * Both have the same devnum
@@ -822,6 +893,8 @@ static int ft60x_probe(struct usb_interface *interface,
 	if(host_interface->desc.bInterfaceNumber == 0) {
 
 		retval = ft60x_allocate_ctrl_interface(interface, id);
+		if (retval)
+			goto error;
 		retval = usb_register_dev(interface, &ft60x_class);
 	} else {
 
@@ -834,38 +907,6 @@ static int ft60x_probe(struct usb_interface *interface,
 	return 0;
 error:
 	return retval;
-}
-
-static void ft60x_delete_ctrl(struct kref *kref)
-{
-	struct ft60x_ctrl_dev *ctrl_dev = container_of(kref, struct ft60x_ctrl_dev, kref);
-
-	if(ctrl_dev->int_in_buffer){
-		usb_free_coherent(
-			ctrl_dev->udev,
-			ctrl_dev->int_in_size,
-			ctrl_dev->int_in_buffer,
-			ctrl_dev->int_in_data_dma
-			);
-	}
-	kfree(ctrl_dev);
-}
-
-static void ft60x_delete_data(struct kref *kref)
-{
-	struct ft60x_data_dev *data_dev = container_of(kref, struct ft60x_data_dev, kref);
-	int i;
-	
-	for(i=0; i< FT60X_EP_PAIR_MAX; i++){
-
-		if(data_dev->ep_pair[i].bulk_in_urb){
-			usb_free_urb(data_dev->ep_pair[i].bulk_in_urb);
-		}
-		
-		ft60x_ring_free(&data_dev->ep_pair[i].ring);
-	}
-		
-	kfree(data_dev);
 }
 
 static int ft60x_suspend(struct usb_interface *intf, pm_message_t message)
@@ -899,24 +940,29 @@ static void ft60x_disconnect(struct usb_interface *interface)
 	struct ft60x_ctrl_dev *ctrl_dev;
 	struct ft60x_data_dev *data_dev;
 	int i;
-	
+
 	host_interface = interface->cur_altsetting;
 
 	printk(KERN_INFO "%s called\n", __func__);
-	
+
 	if(host_interface->desc.bInterfaceNumber == 0) {
 		/* ctrl interface */
 
 		ctrl_dev = usb_get_intfdata(interface);
+		usb_set_intfdata(interface, NULL);
+
+		usb_deregister_dev(interface, &ft60x_class);
+
 		list_del(&ctrl_dev->ctrl_list);
-		
+
 		kref_put(&ctrl_dev->kref, ft60x_delete_ctrl);
 
 	} else {
 		/* data interface */
-		
+
 		data_dev = usb_get_intfdata(interface);
-		
+		usb_set_intfdata(interface, NULL);
+
 		for(i = 0; i < FT60X_EP_PAIR_MAX; i++) {
 			if(data_dev->ep_pair[i].used) {
 				cdev_del(&data_dev->ep_pair[i].cdev);
@@ -925,13 +971,10 @@ static void ft60x_disconnect(struct usb_interface *interface)
 		}
 
 		ft60x_unregister_baseminor(data_dev->baseminor);
-
 		list_del(&data_dev->data_list);
 
 		kref_put(&data_dev->kref, ft60x_delete_data);
 	}
-	
-	usb_deregister_dev(interface, &ft60x_class);
 }
 
 static struct usb_driver ft60x_driver = {
