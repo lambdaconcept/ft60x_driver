@@ -29,7 +29,7 @@
 
 #define FT60X_EP_PAIR_MAX       4
 #define FT60X_DEVICE_NAME       "ft60x"
-#define FT60X_NUM_DEVICES       256
+#define FT60X_MAX_MINORS        256
 
 /* table of devices that work with this driver */
 static const struct usb_device_id ft60x_table[] = {
@@ -80,8 +80,10 @@ static LIST_HEAD(ft60x_data_list);
 static struct usb_driver ft60x_driver;
 static int ft60x_open(struct inode *inode, struct file *file);
 static int ft60x_data_open(struct inode *inode, struct file *file);
+
 static struct class* class  = NULL; ///< The device-driver class struct pointer
 static dev_t devt; // Global variable for the first device number
+static char ft60x_minors[FT60X_MAX_MINORS / FT60X_EP_PAIR_MAX];
 
 static const struct file_operations ft60x_fops = {
         .owner =        THIS_MODULE,
@@ -191,6 +193,7 @@ struct ft60x_data_dev {
 	struct usb_device       *udev;                  /* the usb device for this device */
 	
 	int                      major;                 /* Major of the chardev */
+    int                      baseminor;             /* First minor in the data ep group */
 	struct kref              kref;
 	struct ft60x_endpoint    ep_pair[FT60X_EP_PAIR_MAX];                 /* 4 different endpoint max */
 };
@@ -584,7 +587,7 @@ static int ft60x_add_device(struct ft60x_data_dev *data_dev, int minor, int idx)
 {
 	
 	struct device* device = NULL; ///< The device-driver device struct pointer
-    dev_t dev = MKDEV(data_dev->major, idx);
+    dev_t newdev;
     int ret;
 	
 	/*
@@ -600,16 +603,17 @@ static int ft60x_add_device(struct ft60x_data_dev *data_dev, int minor, int idx)
 	
  
 	// Register the device driver
+    newdev = MKDEV(data_dev->major, data_dev->baseminor + idx);
 	printk(KERN_INFO "device_create: %d %d %d\n", data_dev->major, minor , idx);
     printk(KERN_INFO "drvdata: %p\n", &data_dev->ep_pair[idx]);
-	device = device_create(class, NULL, dev, NULL, "ft60x%d%c", minor, idx + 'a');
+	device = device_create(class, NULL, newdev, NULL, "ft60x%d%c", minor, idx + 'a');
 	if (IS_ERR(device)){               // Clean up if there is an error
 		printk(KERN_ALERT "Failed to create the device\n");
 		goto error;
 	}
 
     cdev_init(&data_dev->ep_pair[idx].cdev, &ft60x_data_fops);
-    if ((ret = cdev_add(&data_dev->ep_pair[idx].cdev, dev, 1)) < 0)
+    if ((ret = cdev_add(&data_dev->ep_pair[idx].cdev, newdev, 1)) < 0)
 	{
 		printk(KERN_ALERT "Failed to add the device\n");
 		return ret;
@@ -622,6 +626,29 @@ error:
 	return -1;
 }
  
+static int ft60x_register_baseminor(void)
+{
+    int i;
+
+    for (i=0; i<sizeof(ft60x_minors); i++)
+    {
+        if (!ft60x_minors[i])
+        {
+            ft60x_minors[i] = 1;
+            return i * FT60X_EP_PAIR_MAX;
+        }
+    }
+
+    return -1;
+}
+
+static void ft60x_unregister_baseminor(int baseminor)
+{
+    int idx = baseminor / FT60X_EP_PAIR_MAX;
+
+    if (idx < sizeof(ft60x_minors))
+        ft60x_minors[idx] = 0;
+}
 
 static int ft60x_allocate_data_interface(struct usb_interface *interface,
 					 const struct usb_device_id *id)
@@ -678,6 +705,11 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
     }
 	*/
     data_dev->major = MAJOR(devt);
+    data_dev->baseminor = ft60x_register_baseminor();
+    if (data_dev->baseminor < 0) {
+        printk("ERR Alloc minor\n");
+        goto error;
+    }
 
 	/* Attemp to find the ctrl interface of this ctrl intf */
 	list_for_each_entry(ctrl_dev, &ft60x_ctrl_list, ctrl_list) {
@@ -950,10 +982,11 @@ static void ft60x_disconnect(struct usb_interface *interface)
 		for(i = 0; i < FT60X_EP_PAIR_MAX; i++){
 			if(data_dev->ep_pair[i].used){
                 cdev_del(&data_dev->ep_pair[i].cdev);
-				device_destroy(class, MKDEV(data_dev->major, i));
+				device_destroy(class, MKDEV(data_dev->major, data_dev->baseminor + i));
 			}
 		}
 		
+        ft60x_unregister_baseminor(data_dev->baseminor);
 		// unregister_chrdev_region(data_dev->major, FT60X_EP_PAIR_MAX);
 
 		list_del(&data_dev->data_list);
@@ -1013,7 +1046,7 @@ static int __init ft60x_init(void)
 		return PTR_ERR(class);
 	}
 
-	rc = alloc_chrdev_region(&devt, 0, FT60X_NUM_DEVICES, FT60X_DEVICE_NAME);
+	rc = alloc_chrdev_region(&devt, 0, FT60X_MAX_MINORS , FT60X_DEVICE_NAME);
 	if (rc) {
 		pr_err("failed to allocate char dev region\n");
 		goto err_region;
@@ -1028,7 +1061,7 @@ static int __init ft60x_init(void)
 	return rc;
 
 err_usb:
-	unregister_chrdev_region(devt, FT60X_NUM_DEVICES);
+	unregister_chrdev_region(devt, FT60X_MAX_MINORS );
 err_region:
 	class_destroy(class);
 	class = NULL;
@@ -1039,7 +1072,7 @@ err_region:
 static void __exit ft60x_exit(void)
 {
 	usb_deregister(&ft60x_driver);
-	unregister_chrdev_region(devt, FT60X_NUM_DEVICES);
+	unregister_chrdev_region(devt, FT60X_MAX_MINORS );
 	class_destroy(class);
 	class = NULL;
 }
