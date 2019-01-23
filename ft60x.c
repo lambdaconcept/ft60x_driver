@@ -914,7 +914,7 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	/* save our data pointer in this interface device */
 	usb_set_intfdata(interface, data_dev);
 
-	/* Attemp to find the ctrl interface of this ctrl intf */
+	/* Attempt to find the ctrl interface of this data intf */
 	list_for_each_entry(ctrl_dev, &ft60x_ctrl_list, ctrl_list) {
 		if (ctrl_dev->devnum == data_dev->devnum) {
 			printk(KERN_INFO "Found ctrl: %d\n", data_dev->devnum);
@@ -941,10 +941,12 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 
 			printk("BULK IN %d\n", i);
 			/* we found a bulk in endpoint */
-			ft60x_add_device(data_dev,
+			retval = ft60x_add_device(data_dev,
 					 data_dev->ctrl_dev->interface->minor,
 					 ep_pair_num);
-			// XXX check retval
+			if (retval < 0) {
+				goto error;
+			}
 			printk(KERN_INFO "%d %d\n",
 			       data_dev->ctrl_dev->interface->minor,
 			       ep_pair_num);
