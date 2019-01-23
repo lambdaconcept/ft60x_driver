@@ -1218,10 +1218,10 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	 * we should not ask more than what is available
 	 */
 	if (notif) {
-		readlen = min(ep->bulk_in_size * 128, count);
+		readlen = min(ep->bulk_in_size, count);
 	} else {
 		/* ignore count, read a full packet */
-		readlen = ep->bulk_in_size * 128;
+		readlen = ep->bulk_in_size;
 	}
 
 	/* 
