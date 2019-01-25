@@ -79,9 +79,15 @@ static LIST_HEAD(ft60x_ctrl_list);
 static LIST_HEAD(ft60x_data_list);
 static struct usb_driver ft60x_driver;
 
-static int ft60x_open(struct inode *inode, struct file *file);
-static int ft60x_release(struct inode *inode, struct file *file);
+/* File operations for Ctrl device */
+static int ft60x_ctrl_open(struct inode *inode, struct file *file);
+static int ft60x_ctrl_release(struct inode *inode, struct file *file);
+static ssize_t ft60x_ctrl_read(struct file *file, char *user_buffer,
+			  size_t count, loff_t * ppos);
+static ssize_t ft60x_ctrl_write(struct file *file, const char *user_buffer,
+				size_t count, loff_t * ppos);
 
+/* File operations for Data device */
 static int ft60x_data_open(struct inode *inode, struct file *file);
 static int ft60x_data_release(struct inode *inode, struct file *file);
 static ssize_t ft60x_data_read(struct file *file, char *user_buffer,
@@ -96,10 +102,10 @@ static char ft60x_minors[FT60X_MAX_MINORS / FT60X_EP_PAIR_MAX];
 
 static const struct file_operations ft60x_ctrl_fops = {
 	.owner =	THIS_MODULE,
-	.read =		NULL,
-	.write =	NULL,
-	.open =		ft60x_open,
-	.release =	ft60x_release,
+	.read =		ft60x_ctrl_read,
+	.write =	ft60x_ctrl_write,
+	.open =		ft60x_ctrl_open,
+	.release =	ft60x_ctrl_release,
 	.flush =	NULL,
 	.poll =		NULL,
 	.unlocked_ioctl = NULL,
@@ -512,15 +518,23 @@ exit:
 	}
 }
 
-static void ft60x_print_config(struct ft60x_config *cfg)
+static void ft60x_print_config(struct ft60x_ctrl_dev *ctrl_dev)
 {
-	printk(KERN_INFO "vendorid: %04x\n", cfg->VendorID);
-	printk(KERN_INFO "productid: %04x\n", cfg->ProductID);
-	printk(KERN_INFO "fifoclock: %02x\n", cfg->FIFOClock);
-	printk(KERN_INFO "fifomode: %02x\n", cfg->FIFOMode);
-	printk(KERN_INFO "channel: %02x\n", cfg->ChannelConfig);
-	printk(KERN_INFO "optional: %04x\n", cfg->OptionalFeatureSupport);
-	printk(KERN_INFO "msiocontrol: %04x\n", cfg->MSIO_Control);
+	struct ft60x_config *cfg;
+	struct device *d;
+
+	cfg = &ctrl_dev->ft60x_cfg;
+	d = &ctrl_dev->interface->dev;
+
+	dev_info(d, "Current configuration:\n");
+	dev_info(d, "   VendorID:        0x%04x\n", cfg->VendorID);
+	dev_info(d, "   ProductID:       0x%04x\n", cfg->ProductID);
+	dev_info(d, "   FIFOClock:       0x%02x\n", cfg->FIFOClock);
+	dev_info(d, "   FIFOMode:        0x%02x\n", cfg->FIFOMode);
+	dev_info(d, "   ChannelConfig:   0x%02x\n", cfg->ChannelConfig);
+	dev_info(d, "   OptionalFeature: 0x%04x\n", cfg->OptionalFeatureSupport);
+	dev_info(d, "   MSIOControl:     0x%08x\n", cfg->MSIO_Control);
+	dev_info(d, "   GPIOControl:     0x%08x\n", cfg->GPIO_Control);
 }
 
 static int ft60x_set_config(struct ft60x_ctrl_dev *ctrl_dev,
@@ -553,7 +567,7 @@ static int ft60x_set_config(struct ft60x_ctrl_dev *ctrl_dev,
 			      0xcf, USB_TYPE_VENDOR | USB_DIR_OUT, 0, 0, cfg,
 			      sizeof(struct ft60x_config), USB_CTRL_SET_TIMEOUT);
 
-	printk("RETURN FROM CONFIG\n");
+	printk("RETURN FROM CONFIG: %d\n", ret);
 
 	if (ret < 0) {
 		ret = -EIO;
@@ -591,9 +605,12 @@ static int ft60x_get_config(struct ft60x_ctrl_dev *ctrl_dev)
 		goto exit;
 	}
 
-	if (ret <= sizeof(struct ft60x_config)) {
-		memcpy(&ctrl_dev->ft60x_cfg, cfg, ret);
+	if (ret > sizeof(struct ft60x_config)) {
+		retval = -EFBIG;
+		goto exit;
 	}
+
+	memcpy(&ctrl_dev->ft60x_cfg, cfg, ret);
 
 exit:
 	if (cfg) {
@@ -792,7 +809,7 @@ static int ft60x_allocate_ctrl_interface(struct usb_interface *interface,
 	retval = ft60x_get_config(ctrl_dev);
 	if (retval)
 		goto error;
-	ft60x_print_config(&ctrl_dev->ft60x_cfg);
+	ft60x_print_config(ctrl_dev);
 
 	retval = ft60x_get_unknown(ctrl_dev);
 	if (retval)
@@ -920,6 +937,7 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 	data_dev->baseminor = ft60x_register_baseminor();
 	if (data_dev->baseminor < 0) {
 		printk("ERR Alloc minor\n");
+		retval = data_dev->baseminor;
 		goto error;
 	}
 
@@ -1549,13 +1567,12 @@ exit:
 	return retval;
 }
 
-static int ft60x_open(struct inode *inode, struct file *file)
+static int ft60x_ctrl_open(struct inode *inode, struct file *file)
 {
 	struct usb_interface *interface;
 	int subminor;
 	int retval = 0;
 	struct ft60x_ctrl_dev *ctrl_dev;
-	struct ft60x_config cstm;
 
 	printk(KERN_INFO "%s called\n", __func__);
 	subminor = iminor(inode);
@@ -1584,24 +1601,17 @@ static int ft60x_open(struct inode *inode, struct file *file)
 	/* save our object in the file's private structure */
 	file->private_data = ctrl_dev;
 
-	/*
-	   memcpy(&cstm, &ctrl_dev->ft60x_cfg, sizeof(struct ft60x_config));
-	   cstm.FIFOMode=1;
-	   cstm.ChannelConfig=0;
-
-	   retval = ft60x_set_config(ctrl_dev, &cstm);
-
-	   ft60x_print_config(&ctrl_dev->ft60x_cfg);
-	 */
 	return retval;
 exit:
 	printk(KERN_INFO "ERROR OPEN\n");
 	return retval;
 }
 
-static int ft60x_release(struct inode *inode, struct file *file)
+static int ft60x_ctrl_release(struct inode *inode, struct file *file)
 {
 	struct ft60x_ctrl_dev *ctrl_dev;
+
+	printk(KERN_INFO "%s called\n", __func__);
 
 	ctrl_dev = file->private_data;
 	if (ctrl_dev == NULL)
@@ -1610,6 +1620,52 @@ static int ft60x_release(struct inode *inode, struct file *file)
 	/* decrement the count on our device */
 	kref_put(&ctrl_dev->kref, ft60x_delete_ctrl);
 	return 0;
+}
+
+static ssize_t ft60x_ctrl_read(struct file *file, char *user_buffer,
+			  size_t count, loff_t * ppos)
+{
+	size_t len;
+	struct ft60x_ctrl_dev *ctrl_dev;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	ctrl_dev = file->private_data;
+	if (ctrl_dev == NULL)
+		return -ENODEV;
+
+	len = min(sizeof(struct ft60x_config), count);
+
+	if (copy_to_user(user_buffer, &ctrl_dev->ft60x_cfg, len))
+		return -EFAULT;
+
+	return len;
+}
+
+static ssize_t ft60x_ctrl_write(struct file *file, const char *user_buffer,
+				size_t count, loff_t * ppos)
+{
+	int ret;
+	struct ft60x_ctrl_dev *ctrl_dev;
+	struct ft60x_config cfg;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	ctrl_dev = file->private_data;
+	if (ctrl_dev == NULL)
+		return -ENODEV;
+
+	if (count != sizeof(struct ft60x_config))
+		return -EINVAL;
+
+	if (copy_from_user(&cfg, user_buffer, count))
+		return -EFAULT;
+
+	ret = ft60x_set_config(ctrl_dev, &cfg);
+	if (ret < 0)
+		return ret;
+
+	return count;
 }
 
 /*                                                                           
