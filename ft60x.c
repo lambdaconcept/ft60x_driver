@@ -1,6 +1,7 @@
 /*
  *
- * Copyright (C) 2019 ramtin@lambdaconcept.com
+ * Copyright (C) 2019 Ramtin AMIN ramtin@lambdaconcept.com
+ * Copyright (C) 2019 Pierre-Olivier Vauboin po@lambdaconcept.com
  *
  *	This program is free software; you can redistribute it and/or
  *	modify it under the terms of the GNU General Public License as
@@ -171,6 +172,13 @@ struct ft60x_irqresp {
 	u8	cmd;
 	u16	len;
 	u32	unk1;
+} __attribute__((packed));
+
+struct ft60x_openio {
+	u8	unk0;
+	u8	devnum;
+	u8	cmd;
+	u8	unk1;
 } __attribute__((packed));
 
 struct ft60x_node_s {
@@ -485,7 +493,7 @@ static void ft60x_int_callback(struct urb *urb)
 			ft60x_do_data_read_io(ep, resp->len);
 
 			spin_lock_irq(&ep->err_lock);
-			ep->waiting_notif = 0;
+			ep->waiting_notif = false;
 			spin_unlock_irq(&ep->err_lock);
 
 			wake_up_interruptible(&ep->bulk_in_wait);
@@ -1002,6 +1010,63 @@ error:
 	return retval;
 }
 
+/*
+ * When opening the device, it is necessary to send it those value
+ * in order to notify it (is it flushing ?)
+ */
+
+static int ft60x_data_open_io(struct ft60x_ctrl_dev *ctrl_dev)
+{
+	int retval = 0;
+	int ret;
+	struct ft60x_openio *val = NULL;
+
+	if (!ctrl_dev) {
+		retval = -EINVAL;
+		goto exit;
+	}
+
+	val = kmalloc(sizeof(struct ft60x_openio), GFP_NOIO);
+	if (!val) {
+		retval = -ENOMEM;
+		goto exit;
+	}
+
+	ret = usb_control_msg(ctrl_dev->udev, usb_rcvctrlpipe(ctrl_dev->udev, 0),
+			      0x03, USB_TYPE_VENDOR | USB_DIR_IN, 1, 0x8000, val, 4,
+			      USB_CTRL_SET_TIMEOUT);
+	if (ret < 0) {
+		retval = -EIO;
+		printk(KERN_ERR "GOT ERROR1: %d\n", retval);
+		goto exit;
+	}
+
+	printk("Val gotten from open: %02x, %02x, %02x, %02x\n", val->unk0, val->devnum, val->cmd, val->unk1);
+
+	/*
+	 * Set this unknown bit only when not set already
+	 */
+	if (!(val->cmd & 0x20)) {
+		printk("Sending bit 0x20\n");
+		val->cmd |= 0x20;
+
+		ret = usb_control_msg(ctrl_dev->udev, usb_sndctrlpipe(ctrl_dev->udev, 0),
+				      0x03, USB_TYPE_VENDOR | USB_DIR_OUT, 1, 0x8000, val, 4,
+				      USB_CTRL_SET_TIMEOUT);
+		if (ret < 0) {
+			retval = -EIO;
+			printk(KERN_ERR "GOT ERROR2: %d\n", retval);
+			goto exit;
+		}
+	}
+
+exit:
+	if (val) {
+		kfree(val);
+	}
+	return retval;
+}
+
 static int ft60x_data_open(struct inode *inode, struct file *file)
 {
 	int ret;
@@ -1009,6 +1074,7 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	unsigned int mn = iminor(inode);
 	struct ft60x_endpoint *ep;
 	int opened;
+	unsigned int kref_num;
 
 	printk(KERN_INFO "%s called\n", __func__);
 	printk(KERN_INFO "major: %i, minor: %i\n", mj, mn);
@@ -1025,6 +1091,14 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	ret = ft60x_ring_init(&ep->ring, ep->bulk_in_size);
 	if (ret < 0) {
 		goto error;
+	}
+
+	/* read kref to look for the first open */
+	kref_num = kref_read(&ep->data_dev->kref);
+	printk(KERN_INFO "kref = %d\n", kref_num);
+
+	if(kref_num == 1) { /* probe already gets kref once */
+		ft60x_data_open_io(ep->data_dev->ctrl_dev);
 	}
 
 	/* increment our usage count for the device */
@@ -1187,7 +1261,7 @@ static int ft60x_send_cmdread(struct ft60x_endpoint *ep, size_t reqlen,
 	req = &ep->data_dev->ctrl_dev->ctrlreq;
 	req->idx++;
 	req->ep = ep->bulk_in_endpointAddr;
-	req->cmd = 1; // XXX 1
+	req->cmd = 1;
 	req->len = reqlen;
 
 	retval = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, asynchronous);
@@ -1224,7 +1298,7 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 		ep->ring.wr->len = urb->actual_length;
 	}
 
-	ep->ongoing_read = 0;
+	ep->ongoing_read = false;
 	spin_unlock(&ep->err_lock);
 
 	wake_up_interruptible(&ep->bulk_in_wait);
@@ -1259,9 +1333,9 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	 * and thus sending the command asynchronously.
 	 */
 	if (notif) {
-		ft60x_send_cmdread(ep, readlen, 1);
+		ft60x_send_cmdread(ep, readlen, true);
 	} else {
-		ft60x_send_cmdread(ep, readlen, 0);
+		ft60x_send_cmdread(ep, readlen, false);
 	}
 
 	/*
@@ -1279,6 +1353,8 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 
 	printk(KERN_INFO "Ring add node: using node %p\n", ep->ring.wr);
 
+	mutex_lock(&ep->data_dev->io_mutex);
+
 	usb_fill_bulk_urb(ep->bulk_in_urb,
 			  ep->data_dev->udev,
 			  usb_rcvbulkpipe(ep->data_dev->udev,
@@ -1290,11 +1366,13 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 
 	/* tell everybody to leave the URB alone */
 	spin_lock_irq(&ep->err_lock);
-	ep->ongoing_read = 1;
+	ep->ongoing_read = true;
 	spin_unlock_irq(&ep->err_lock);
 
 	/* do it */
 	rv = usb_submit_urb(ep->bulk_in_urb, GFP_KERNEL);
+
+	mutex_unlock(&ep->data_dev->io_mutex);
 
 	printk(KERN_INFO "submitted ! %s\n", __func__);
 
@@ -1304,7 +1382,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 			__func__, rv);
 		rv = (rv == -ENOMEM) ? rv : -EIO;
 		spin_lock_irq(&ep->err_lock);
-		ep->ongoing_read = 0;
+		ep->ongoing_read = false;
 		spin_unlock_irq(&ep->err_lock);
 	}
 	return rv;
@@ -1405,7 +1483,7 @@ retry:
 				goto exit;
 		} else {
 			spin_lock_irq(&ep->err_lock);
-			ep->waiting_notif = 1;
+			ep->waiting_notif = true;
 			spin_unlock_irq(&ep->err_lock);
 		}
 		goto retry;
@@ -1433,7 +1511,7 @@ static void ft60x_data_write_bulk_callback(struct urb *urb)
 				__func__, urb->status);
 
 		spin_lock(&ep->err_lock);
-		ep->busy_write = 0;
+		ep->busy_write = false;
 		ep->errors = urb->status;
 		spin_unlock(&ep->err_lock);
 		// wake_up_interruptible(&dev->bulk_out_wait);
@@ -1541,7 +1619,7 @@ static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 		goto error_unanchor;
 	}
 	spin_lock_irq(&ep->err_lock);
-	ep->busy_write = 1;
+	ep->busy_write = true;
 	spin_unlock_irq(&ep->err_lock);
 
 	/*
