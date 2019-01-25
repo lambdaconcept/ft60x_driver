@@ -237,18 +237,22 @@ struct ft60x_ctrl_dev {
 
 static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count);
 
-static int ft60x_ring_add_node(struct ft60x_ring_s *l)
+static int ft60x_ring_add_node(struct ft60x_ring_s *r)
 {
 	struct ft60x_node_s *tmp;
 
+	if (!r || !r->wr) {
+		return -EINVAL;
+	}
+
 	/* use current node if available */
-	if (!l->wr->len) {
+	if (!r->wr->len) {
 		return 0;
 	}
 
 	/* use next node is available */
-	if (!l->wr->next->len) {
-		l->wr = l->wr->next;
+	if (!r->wr->next->len) {
+		r->wr = r->wr->next;
 		return 0;
 	}
 
@@ -259,17 +263,17 @@ static int ft60x_ring_add_node(struct ft60x_ring_s *l)
 	}
 	memset(tmp, 0, sizeof(struct ft60x_node_s));
 
-	tmp->bulk_in_buffer = kmalloc(l->ep_size, GFP_KERNEL);
+	tmp->bulk_in_buffer = kmalloc(r->ep_size, GFP_KERNEL);
 	if (!tmp->bulk_in_buffer) {
 		kfree(tmp);
 		return -ENOMEM;
 	}
 
-	tmp->prev = l->wr;
-	tmp->next = l->wr->next;
-	l->wr->next->prev = tmp;
-	l->wr->next = tmp;
-	l->wr = tmp;
+	tmp->prev = r->wr;
+	tmp->next = r->wr->next;
+	r->wr->next->prev = tmp;
+	r->wr->next = tmp;
+	r->wr = tmp;
 
 	return 0;
 }
@@ -300,6 +304,10 @@ static ssize_t ft60x_ring_read(struct ft60x_ring_s *r, char *user_buffer,
 	size_t rlen = len;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	if (!r || !r->rd) {
+		return -EINVAL;
+	}
 
 	while (r->rd->len) {
 		printk(KERN_INFO "Ring read: using node %p, %ld, %ld\n", r->rd,
@@ -382,6 +390,9 @@ void ft60x_ring_free(struct ft60x_ring_s *r)
 			kfree(o);
 		}
 	} while (o != p);
+
+	r->wr = NULL;
+	r->rd = NULL;
 }
 
 static struct ft60x_endpoint *ft60x_find_endpoint(struct ft60x_data_dev
@@ -1158,7 +1169,7 @@ static int ft60x_send_cmdread(struct ft60x_endpoint *ep, size_t reqlen,
 	req = &ep->data_dev->ctrl_dev->ctrlreq;
 	req->idx++;
 	req->ep = ep->bulk_in_endpointAddr;
-	req->cmd = 1;
+	req->cmd = 1; // XXX 1
 	req->len = reqlen;
 
 	retval = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, asynchronous);
@@ -1213,7 +1224,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	notif = ft60x_endpoint_has_notification(ep);
 	printk("NOTIF: %d\n", notif);
 
-	/* 
+	/*
 	 * when in notification mode,
 	 * we should not ask more than what is available
 	 */
@@ -1224,7 +1235,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 		readlen = ep->bulk_in_size;
 	}
 
-	/* 
+	/*
 	 * we must inform the chip of how much data bytes we want to read.
 	 * when in notification mode, we are called from callback context
 	 * and thus sending the command asynchronously.
@@ -1235,10 +1246,16 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 		ft60x_send_cmdread(ep, readlen, 0);
 	}
 
+	/*
+	 * in notification mode we may be called without the char dev opened,
+	 */
 	/* get the next empty node from the ring buffer */
-	// XXX what if char dev is not opened
+	// XXX
+	// if (!atomic_read(&ep->opened)) {
+	// }
 	ret = ft60x_ring_add_node(&ep->ring);
 	if (ret < 0) {
+		printk("cannot add node to ring\n");
 		return ret;
 	}
 
