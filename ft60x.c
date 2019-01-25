@@ -1010,11 +1010,159 @@ error:
 	return retval;
 }
 
+static int ft60x_send_ctrlreq(struct ft60x_ctrl_dev *ctrl_dev,
+			      bool asynchronous)
+{
+	int len = 0;
+	u8 *buf = NULL;
+	int retval = 0;
+	struct urb *urb = NULL;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	if (!ctrl_dev) {
+		retval = -EINVAL;
+		goto exit;
+	}
+
+	buf = kmalloc(sizeof(struct ft60x_ctrlreq), GFP_KERNEL);
+	if (!buf) {
+		retval = -ENOMEM;
+		goto exit;
+	}
+
+	memcpy(buf, &ctrl_dev->ctrlreq, sizeof(struct ft60x_ctrlreq));
+
+	if (asynchronous) {
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (!urb) {
+			retval = -ENOMEM;
+			goto exit;
+		}
+
+		usb_fill_bulk_urb(urb, ctrl_dev->udev,
+				  usb_sndbulkpipe(ctrl_dev->udev,
+						  ctrl_dev->bulk_out_endpointAddr),
+				  buf, sizeof(struct ft60x_ctrlreq),
+				  ft60x_ctrlreq_callback, NULL);
+		/// XXX anchor urb
+
+		retval = usb_submit_urb(urb, GFP_KERNEL);
+		if (retval) {
+			dev_err(&ctrl_dev->interface->dev,
+				"%s - failed submitting ctrlreq urb, error %d\n",
+				__func__, retval);
+			goto exit;
+		}
+	} else {
+		retval = usb_bulk_msg(ctrl_dev->udev,
+				      usb_sndbulkpipe(ctrl_dev->udev,
+						      ctrl_dev->bulk_out_endpointAddr),
+				      buf, sizeof(struct ft60x_ctrlreq), &len,
+				      1000);
+		if (retval) {
+			printk("%s: command bulk message failed: error %d\n",
+			       __func__, retval);
+			goto exit;
+		}
+	}
+
+exit:
+	if (urb) {
+		usb_free_urb(urb);
+	}
+	if (buf) {
+		kfree(buf);
+	}
+
+	printk(KERN_INFO "EXIT from %s, async == %d\n", __func__, asynchronous);
+
+	return retval;
+}
+
+static int ft60x_fill_ctrlreq(struct ft60x_endpoint *ep, u8 cmd, size_t len)
+{
+	int retval = 0;
+	struct ft60x_ctrlreq *req;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	if (!ep) {
+		retval = -ENODEV;
+		goto exit;
+	}
+
+	// XXX mutex this in calling function, maybe use data_dev io_mutex ??
+	req = &ep->data_dev->ctrl_dev->ctrlreq;
+	req->idx++;
+	req->ep = ep->bulk_in_endpointAddr;
+	req->cmd = cmd;
+	req->len = len;
+
+exit:
+	return retval;
+}
+
+static int ft60x_send_cmdread(struct ft60x_endpoint *ep, size_t reqlen,
+			      bool asynchronous)
+{
+	int ret = 0;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	/* read command */
+	ret = ft60x_fill_ctrlreq(ep, 1, reqlen);
+	if (ret < 0) {
+		goto exit;
+	}
+
+	ret = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, asynchronous);
+	if (ret < 0) {
+		goto exit;
+	}
+
+	printk(KERN_INFO "EXIT %s\n", __func__);
+exit:
+	return ret;
+}
+
+static int ft60x_send_cmdrelease(struct ft60x_endpoint *ep)
+{
+	int ret = 0;
+
+	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	/* unknown command, maybe flush ? */
+	ret = ft60x_fill_ctrlreq(ep, 0, 0);
+	if (ret < 0) {
+		goto exit;
+	}
+
+	ret = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, false);
+	if (ret < 0) {
+		goto exit;
+	}
+
+	/* unknown command, maybe close ? */
+	ret = ft60x_fill_ctrlreq(ep, 3, 0);
+	if (ret < 0) {
+		goto exit;
+	}
+
+	ret = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, false);
+	if (ret < 0) {
+		goto exit;
+	}
+
+	printk(KERN_INFO "EXIT %s\n", __func__);
+exit:
+	return ret;
+}
+
 /*
  * When opening the device, it is necessary to send it those value
  * in order to notify it (is it flushing ?)
  */
-
 static int ft60x_data_open_io(struct ft60x_ctrl_dev *ctrl_dev)
 {
 	int retval = 0;
@@ -1125,6 +1273,9 @@ static int ft60x_data_release(struct inode *inode, struct file *file)
 	if (ep == NULL)
 		return -ENODEV;
 
+	/* notify the chip we are going to close */
+	ft60x_send_cmdrelease(ep);
+
 	file->private_data = NULL;
 
 	/* Free Ring struture */
@@ -1149,6 +1300,7 @@ static __poll_t ft60x_data_poll(struct file *file, poll_table *wait)
 	if (ep == NULL)
 		return -ENODEV;
 
+	// XXX this does not work when not in notification mode
 	poll_wait(file, &ep->bulk_in_wait, wait);
 	// XXX add poll_wait for bulk_out_wait ??
 
@@ -1173,103 +1325,6 @@ static __poll_t ft60x_data_poll(struct file *file, poll_table *wait)
 	}
 
 	return ret;
-}
-
-static int ft60x_send_ctrlreq(struct ft60x_ctrl_dev *ctrl_dev,
-			      bool asynchronous)
-{
-	int len = 0;
-	u8 *buf = NULL;
-	int retval = 0;
-	struct urb *urb = NULL;
-
-	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
-
-	if (!ctrl_dev) {
-		retval = -EINVAL;
-		goto exit;
-	}
-
-	buf = kmalloc(sizeof(struct ft60x_ctrlreq), GFP_KERNEL);
-	if (!buf) {
-		retval = -ENOMEM;
-		goto exit;
-	}
-
-	memcpy(buf, &ctrl_dev->ctrlreq, sizeof(struct ft60x_ctrlreq));
-
-	if (asynchronous) {
-		urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!urb) {
-			retval = -ENOMEM;
-			goto exit;
-		}
-
-		usb_fill_bulk_urb(urb, ctrl_dev->udev,
-				  usb_sndbulkpipe(ctrl_dev->udev,
-						  ctrl_dev->bulk_out_endpointAddr),
-				  buf, sizeof(struct ft60x_ctrlreq),
-				  ft60x_ctrlreq_callback, NULL);
-		/// XXX anchor urb
-
-		retval = usb_submit_urb(urb, GFP_KERNEL);
-		if (retval) {
-			dev_err(&ctrl_dev->interface->dev,
-				"%s - failed submitting ctrlreq urb, error %d\n",
-				__func__, retval);
-			goto exit;
-		}
-	} else {
-		retval = usb_bulk_msg(ctrl_dev->udev,
-				      usb_sndbulkpipe(ctrl_dev->udev,
-						      ctrl_dev->bulk_out_endpointAddr),
-				      buf, sizeof(struct ft60x_ctrlreq), &len,
-				      1000);
-		if (retval) {
-			printk("%s: command bulk message failed: error %d\n",
-			       __func__, retval);
-			goto exit;
-		}
-	}
-
-exit:
-	if (urb) {
-		usb_free_urb(urb);
-	}
-	if (buf) {
-		kfree(buf);
-	}
-
-	printk(KERN_INFO "EXIT from %s, async == %d\n", __func__, asynchronous);
-
-	return retval;
-}
-
-static int ft60x_send_cmdread(struct ft60x_endpoint *ep, size_t reqlen,
-			      bool asynchronous)
-{
-	int retval = 0;
-	struct ft60x_ctrlreq *req;
-
-	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
-
-	if (!ep) {
-		retval = -ENODEV;
-		goto exit;
-	}
-	// XXX mutex this, maybe use data_dev io_mutex ??
-	req = &ep->data_dev->ctrl_dev->ctrlreq;
-	req->idx++;
-	req->ep = ep->bulk_in_endpointAddr;
-	req->cmd = 1;
-	req->len = reqlen;
-
-	retval = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, asynchronous);
-
-	// dev->sent_cmd_read = 1; // XXX
-	printk(KERN_INFO "EXIT %s\n", __func__);
-exit:
-	return retval;
 }
 
 static void ft60x_data_read_bulk_callback(struct urb *urb)
