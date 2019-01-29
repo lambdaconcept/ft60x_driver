@@ -255,7 +255,7 @@ struct ft60x_ctrl_dev {
 	struct ft60x_ctrlreq	ctrlreq;
 };
 
-static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool need_lock);
+static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool has_notif);
 
 static int ft60x_ring_add_node(struct ft60x_ring_s *r)
 {
@@ -434,9 +434,9 @@ static struct ft60x_endpoint *ft60x_find_endpoint(struct ft60x_data_dev
 	return NULL;
 }
 
-static int ft60x_endpoint_has_notification(struct ft60x_endpoint *ep)
+static bool ft60x_endpoint_has_notification(struct ft60x_endpoint *ep)
 {
-	int notif;
+	bool notif;
 
 	/* Get the "Notification Message Feature" which tells if we receive
 	   an interruption via ctrl endpoint when message are available.
@@ -496,7 +496,7 @@ static void ft60x_int_callback(struct urb *urb)
 			 * this is just submitting a read request but not waiting,
 			 * fine to do it in callback context
 			 */
-			ft60x_do_data_read_io(ep, resp->len, false);
+			ft60x_do_data_read_io(ep, resp->len, true);
 
 			spin_lock_irq(&ep->err_lock);
 			ep->waiting_notif = false;
@@ -1365,22 +1365,22 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 	wake_up_interruptible(&ep->bulk_in_wait);
 }
 
-static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool need_lock)
+static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool has_notif)
 {
 	int rv = 0;
-	int notif;
 	int readlen;
+	bool need_lock;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
-	notif = ft60x_endpoint_has_notification(ep);
-	printk("NOTIF: %d\n", notif);
+	has_notif = ft60x_endpoint_has_notification(ep);
+	// printk("NOTIF: %d\n", notif);
 
 	/*
 	 * when in notification mode,
 	 * we should not ask more than what is available
 	 */
-	if (notif) {
+	if (has_notif) {
 		readlen = min(ep->bulk_in_size, count);
 	} else {
 		/* ignore count, read a full packet */
@@ -1392,7 +1392,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool n
 	 * when in notification mode, we are called from callback context
 	 * and thus sending the command asynchronously.
 	 */
-	if (notif) {
+	if (has_notif) {
 		ft60x_send_cmdread(ep, readlen, true);
 	} else {
 		ft60x_send_cmdread(ep, readlen, false);
@@ -1413,6 +1413,12 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool n
 
 	printk(KERN_INFO "Ring add node: using node %p\n", ep->ring.wr);
 
+	/*
+	 * when in notification mode, we are called from callback context
+	 * and thus interface always exists and lock is not required,
+	 * this avoids mutex/sleep in callback context
+	 */
+	need_lock = !has_notif;
 	if (need_lock) {
 		/* this lock makes sure we don't submit URBs to gone devices */
 		mutex_lock(&ep->data_dev->io_mutex);
@@ -1466,6 +1472,7 @@ static ssize_t ft60x_data_read(struct file *file, char *user_buffer,
 	int rv;
 	bool ongoing_io;
 	bool waiting;
+	bool has_notif;
 
 	printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
@@ -1480,6 +1487,7 @@ static ssize_t ft60x_data_read(struct file *file, char *user_buffer,
 	if (rv < 0)
 		return rv;
 
+	has_notif = ft60x_endpoint_has_notification(ep);
 	// ep->done_reading = 0; // XXX ?
 
 	/* if IO is under way, we must not touch things */
@@ -1532,17 +1540,17 @@ retry:
 		 * and we are not in notification mode,
 		 * we start IO but don't wait
 		 */
-		if ((rv < count) && !ft60x_endpoint_has_notification(ep)) {
-			ft60x_do_data_read_io(ep, count - rv, true);
+		if ((rv < count) && !has_notif) {
+			ft60x_do_data_read_io(ep, count - rv, false);
 		}
 	} else {
 		/*
 		 * no data in the buffer,
 		 * start IO only when not in notification mode
 		 */
-		printk(KERN_INFO "no data in the buffer\n");
-		if (!ft60x_endpoint_has_notification(ep)) {
-			rv = ft60x_do_data_read_io(ep, count, true);
+		// printk(KERN_INFO "no data in the buffer\n");
+		if (!has_notif) {
+			rv = ft60x_do_data_read_io(ep, count, false);
 			if (rv < 0)
 				goto exit;
 		} else {
