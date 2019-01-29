@@ -59,6 +59,8 @@ MODULE_DEVICE_TABLE(usb, ft60x_table);
 #define MAX_TRANSFER		2048
 #define WRITES_IN_FLIGHT	8
 
+#define FT60X_IOCTL_DATA_SET_SUBMITSIZE		0
+
 struct ft60x_config {
 	/* Device Descriptor */
 	u16	VendorID;
@@ -103,6 +105,7 @@ static ssize_t ft60x_data_read(struct file *file, char *user_buffer,
 static ssize_t ft60x_data_write(struct file *file, const char *user_buffer,
 				size_t count, loff_t * ppos);
 static __poll_t ft60x_data_poll(struct file *file, poll_table *wait);
+static long ft60x_data_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 static struct class *class = NULL;	/* The device-driver class struct pointer */
 static dev_t devt;		/* Global variable for the first device number */
@@ -128,7 +131,7 @@ static const struct file_operations ft60x_data_fops = {
 	.release =	ft60x_data_release,
 	.flush =	NULL,
 	.poll =		ft60x_data_poll,
-	.unlocked_ioctl = NULL,
+	.unlocked_ioctl = ft60x_data_ioctl,
 	.llseek =	noop_llseek,
 };
 
@@ -199,7 +202,7 @@ struct ft60x_ring_s {
 	struct ft60x_node_s	first;
 	struct ft60x_node_s	*wr;
 	struct ft60x_node_s	*rd;
-	size_t ep_size;				/* node buffer size */
+	size_t buf_size;				/* node buffer size */
 };
 
 struct ft60x_endpoint {
@@ -210,6 +213,7 @@ struct ft60x_endpoint {
 	atomic_t		opened;			/* restrict access to only one user */
 	struct semaphore	limit_sem;		/* limiting the number of writes in progress */
 	size_t			bulk_in_size;
+	size_t			submit_size;		/* size of read bulk buffer without notification */
 	struct urb		*bulk_in_urb;		/* the urb to read data with */
 	wait_queue_head_t	bulk_in_wait;		/* to wait for an ongoing read */
 	__u8			bulk_in_endpointAddr;	/* the address of the bulk in endpoint */
@@ -283,7 +287,7 @@ static int ft60x_ring_add_node(struct ft60x_ring_s *r)
 	}
 	memset(tmp, 0, sizeof(struct ft60x_node_s));
 
-	tmp->bulk_in_buffer = kmalloc(r->ep_size, GFP_KERNEL);
+	tmp->bulk_in_buffer = kmalloc(r->buf_size, GFP_KERNEL);
 	if (!tmp->bulk_in_buffer) {
 		kfree(tmp);
 		return -ENOMEM;
@@ -298,18 +302,19 @@ static int ft60x_ring_add_node(struct ft60x_ring_s *r)
 	return 0;
 }
 
-static int ft60x_ring_init(struct ft60x_ring_s *r, size_t ep_size)
+static int ft60x_ring_init(struct ft60x_ring_s *r, size_t buf_size)
 {
 	memset(r, 0, sizeof(struct ft60x_ring_s));
 
+	printk("ft60x_ring_init size: %ld\n", buf_size);
 	r->first.next = &r->first;
 	r->first.prev = &r->first;
 	r->wr = &r->first;
 	r->rd = &r->first;
-	r->ep_size = ep_size;
+	r->buf_size = buf_size;
 
 	/* allocate the first buffer in the ring */
-	r->first.bulk_in_buffer = kmalloc(r->ep_size, GFP_KERNEL);
+	r->first.bulk_in_buffer = kmalloc(r->buf_size, GFP_KERNEL);
 	if (!r->first.bulk_in_buffer) {
 		return -ENOMEM;
 	}
@@ -389,6 +394,39 @@ static int ft60x_ring_has_data(struct ft60x_ring_s *r)
 	printk("return %d\n", (r->rd->len > 0));
 
 	return (r->rd->len > 0);
+}
+
+static int ft60x_ring_realloc(struct ft60x_ring_s *r, size_t buf_size)
+{
+	struct ft60x_node_s *p = &r->first;
+	struct ft60x_node_s *o;
+	unsigned char *newbuf;
+
+	printk("ft60x_ring_realloc size: %ld\n", buf_size);
+	r->buf_size = buf_size;
+
+	printk("p %p\n", p);
+	printk("p next %p\n", p->next);
+
+	if (!p->next)
+		return -EINVAL;
+
+	do {
+		printk("p next %p\n", p->next);
+		o = p->next;
+		printk("node %p\n", o);
+		if (o->bulk_in_buffer) {
+			newbuf = krealloc(o->bulk_in_buffer, r->buf_size, GFP_KERNEL);
+			if (!newbuf) {
+				printk("realloc fail\n");
+				return -ENOMEM;
+			}
+			o->bulk_in_buffer = newbuf;
+			printk("realloc ok\n");
+		}
+	} while (o != p);
+
+	return 0;
 }
 
 void ft60x_ring_free(struct ft60x_ring_s *r)
@@ -996,6 +1034,12 @@ static int ft60x_allocate_data_interface(struct usb_interface *interface,
 			       ep_pair_num);
 
 			p->bulk_in_size = usb_endpoint_maxp(endpoint);
+			/*
+ 			 * by default we ask to read 128 packets for each
+			 * bulk in urb submit.
+			 * this size can be changed via ioctl on the data chardev
+			*/
+			p->submit_size = p->bulk_in_size * 128;
 			p->bulk_in_endpointAddr = endpoint->bEndpointAddress;
 			p->bulk_in_urb = usb_alloc_urb(0, GFP_KERNEL);
 			if (!p->bulk_in_urb) {
@@ -1242,7 +1286,7 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	}
 
 	/* Initialize RX Ring Structure */
-	ret = ft60x_ring_init(&ep->ring, ep->bulk_in_size * 128); //TODO define
+	ret = ft60x_ring_init(&ep->ring, ep->submit_size);
 	if (ret < 0) {
 		goto error;
 	}
@@ -1333,6 +1377,36 @@ static __poll_t ft60x_data_poll(struct file *file, poll_table *wait)
 	return ret;
 }
 
+static long ft60x_data_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	long ret = 0;
+	struct ft60x_endpoint *ep;
+
+	ep = file->private_data;
+	if (ep == NULL)
+		return -ENODEV;
+
+	switch (cmd) {
+	case FT60X_IOCTL_DATA_SET_SUBMITSIZE:
+		if (arg < ep->bulk_in_size) {
+			ret = -EINVAL;
+			goto exit;
+		}
+		ep->submit_size = arg;
+		ret = ft60x_ring_realloc(&ep->ring, ep->submit_size);
+		if (ret < 0) {
+			printk("Error in realloc\n");
+			goto exit;
+		}
+		break;
+	default:
+		printk(KERN_ERR "Unknown IOCTL %d\n", cmd);
+	}
+
+exit:
+	return ret;
+}
+
 static void ft60x_data_read_bulk_callback(struct urb *urb)
 {
 	struct ft60x_endpoint *ep;
@@ -1383,8 +1457,8 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool h
 	if (has_notif) {
 		readlen = min(ep->bulk_in_size, count);
 	} else {
-		/* ignore count, read a full packet */
-		readlen = ep->bulk_in_size * 128;
+		/* ignore count, read multiple packets */
+		readlen = ep->submit_size;
 	}
 
 	/*
