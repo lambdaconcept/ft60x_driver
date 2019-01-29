@@ -9,6 +9,13 @@
  *
  */
 
+/* 
+ * TODO XXX FIXME
+ * - anchor urbs
+ * - check mutex use
+ * - spinlock check irq / irqsave
+ */
+
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/slab.h>
@@ -160,8 +167,7 @@ struct ft60x_ctrlreq {
 	u8	cmd;
 	u8	unk1;
 	u8	unk2;
-	u16	len;
-	u16	unk3;
+	u32	len;
 	u32	unk4;
 	u32	unk5;
 } __attribute__((packed));
@@ -249,7 +255,7 @@ struct ft60x_ctrl_dev {
 	struct ft60x_ctrlreq	ctrlreq;
 };
 
-static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count);
+static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool need_lock);
 
 static int ft60x_ring_add_node(struct ft60x_ring_s *r)
 {
@@ -490,7 +496,7 @@ static void ft60x_int_callback(struct urb *urb)
 			 * this is just submitting a read request but not waiting,
 			 * fine to do it in callback context
 			 */
-			ft60x_do_data_read_io(ep, resp->len);
+			ft60x_do_data_read_io(ep, resp->len, false);
 
 			spin_lock_irq(&ep->err_lock);
 			ep->waiting_notif = false;
@@ -1236,7 +1242,7 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	}
 
 	/* Initialize RX Ring Structure */
-	ret = ft60x_ring_init(&ep->ring, ep->bulk_in_size);
+	ret = ft60x_ring_init(&ep->ring, ep->bulk_in_size * 128); //TODO define
 	if (ret < 0) {
 		goto error;
 	}
@@ -1359,9 +1365,8 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 	wake_up_interruptible(&ep->bulk_in_wait);
 }
 
-static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
+static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool need_lock)
 {
-	int ret;
 	int rv = 0;
 	int notif;
 	int readlen;
@@ -1379,7 +1384,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 		readlen = min(ep->bulk_in_size, count);
 	} else {
 		/* ignore count, read a full packet */
-		readlen = ep->bulk_in_size;
+		readlen = ep->bulk_in_size * 128;
 	}
 
 	/*
@@ -1400,15 +1405,23 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	// XXX
 	// if (!atomic_read(&ep->opened)) {
 	// }
-	ret = ft60x_ring_add_node(&ep->ring);
-	if (ret < 0) {
+	rv = ft60x_ring_add_node(&ep->ring);
+	if (rv < 0) {
 		printk("cannot add node to ring\n");
-		return ret;
+		goto exit;
 	}
 
 	printk(KERN_INFO "Ring add node: using node %p\n", ep->ring.wr);
 
-	mutex_lock(&ep->data_dev->io_mutex);
+	if (need_lock) {
+		/* this lock makes sure we don't submit URBs to gone devices */
+		mutex_lock(&ep->data_dev->io_mutex);
+		if (!ep->data_dev->interface) {	/* disconnect() was called */
+			mutex_unlock(&ep->data_dev->io_mutex);
+			rv = -ENODEV;
+			goto exit;
+		}
+	}
 
 	usb_fill_bulk_urb(ep->bulk_in_urb,
 			  ep->data_dev->udev,
@@ -1427,7 +1440,9 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 	/* do it */
 	rv = usb_submit_urb(ep->bulk_in_urb, GFP_KERNEL);
 
-	mutex_unlock(&ep->data_dev->io_mutex);
+	if (need_lock) {
+		mutex_unlock(&ep->data_dev->io_mutex);
+	}
 
 	printk(KERN_INFO "submitted ! %s\n", __func__);
 
@@ -1440,6 +1455,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count)
 		ep->ongoing_read = false;
 		spin_unlock_irq(&ep->err_lock);
 	}
+exit:
 	return rv;
 }
 
@@ -1464,13 +1480,6 @@ static ssize_t ft60x_data_read(struct file *file, char *user_buffer,
 	if (rv < 0)
 		return rv;
 
-	// XXX ? /* this lock makes sure we don't submit URBs to gone devices */
-	// XXX ? mutex_lock(&ep->data_dev->io_mutex);
-	/* disconnect() was called */
-	if (!ep->data_dev->interface) {
-		rv = -ENODEV;
-		goto exit;
-	}
 	// ep->done_reading = 0; // XXX ?
 
 	/* if IO is under way, we must not touch things */
@@ -1524,7 +1533,7 @@ retry:
 		 * we start IO but don't wait
 		 */
 		if ((rv < count) && !ft60x_endpoint_has_notification(ep)) {
-			ft60x_do_data_read_io(ep, count - rv);
+			ft60x_do_data_read_io(ep, count - rv, true);
 		}
 	} else {
 		/*
@@ -1533,7 +1542,7 @@ retry:
 		 */
 		printk(KERN_INFO "no data in the buffer\n");
 		if (!ft60x_endpoint_has_notification(ep)) {
-			rv = ft60x_do_data_read_io(ep, count);
+			rv = ft60x_do_data_read_io(ep, count, true);
 			if (rv < 0)
 				goto exit;
 		} else {
