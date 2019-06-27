@@ -208,6 +208,7 @@ struct ft60x_ring_s {
 struct ft60x_endpoint {
 	int			used;			/* endpoint use depends on ft60x current config */
 	struct ft60x_ring_s	ring;			/* Our RING structure to add data in */
+	unsigned char           *trash_buffer;
 	struct ft60x_data_dev	*data_dev;		/* pointer to parent data_dev */
 	struct cdev		cdev;
 	atomic_t		opened;			/* restrict access to only one user */
@@ -506,6 +507,8 @@ static void ft60x_ctrlreq_callback(struct urb *urb)
 		       __func__, urb->status);
 		break;
 	}
+
+	usb_free_urb(urb);
 }
 
 static void ft60x_int_callback(struct urb *urb)
@@ -729,6 +732,9 @@ static void ft60x_delete_data(struct kref *kref)
 	printk(KERN_INFO "%s called\n", __func__);
 
 	for (i = 0; i < FT60X_EP_PAIR_MAX; i++) {
+		if (data_dev->ep_pair[i].trash_buffer) {
+			kfree(data_dev->ep_pair[i].trash_buffer);
+		}
 		if (data_dev->ep_pair[i].bulk_in_urb) {
 			usb_free_urb(data_dev->ep_pair[i].bulk_in_urb);
 		}
@@ -1114,18 +1120,19 @@ static int ft60x_send_ctrlreq(struct ft60x_ctrl_dev *ctrl_dev,
 		if (retval) {
 			printk("%s: command bulk message failed: error %d\n",
 			       __func__, retval);
-			goto exit;
+			goto error;
 		}
 	}
 
-exit:
+	goto exit;
+error:
 	if (urb) {
 		usb_free_urb(urb);
 	}
 	if (buf) {
 		kfree(buf);
 	}
-
+exit:
 	// printk(KERN_INFO "EXIT from %s, async == %d\n", __func__, asynchronous);
 
 	return retval;
@@ -1307,6 +1314,17 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 	file->private_data = ep;
 	printk(KERN_INFO "prvdata: %p\n", file->private_data);
 
+	/* unknown command, maybe flush ? */
+	ret = ft60x_fill_ctrlreq(ep, 0, 0);
+	if (ret < 0) {
+		goto error;
+	}
+
+	ret = ft60x_send_ctrlreq(ep->data_dev->ctrl_dev, false);
+	if (ret < 0) {
+		goto error;
+	}
+
 	return 0;
 
 error:
@@ -1408,7 +1426,7 @@ exit:
 	return ret;
 }
 
-static void ft60x_data_read_bulk_callback(struct urb *urb)
+static void ft60x_data_read_trash_callback(struct urb *urb)
 {
 	struct ft60x_endpoint *ep;
 
@@ -1423,7 +1441,36 @@ static void ft60x_data_read_bulk_callback(struct urb *urb)
 		    urb->status == -ECONNRESET ||
 		    urb->status == -ESHUTDOWN))
 			dev_err(&ep->data_dev->interface->dev,
-				"%s - nonzero write bulk status received: %d\n",
+				"%s - nonzero read bulk status received: %d\n",
+				__func__, urb->status);
+
+		ep->errors = urb->status;
+	} else {
+		printk(KERN_INFO "%s - read %d bytes\n", __func__, urb->actual_length);
+	}
+
+	ep->ongoing_read = false;
+	spin_unlock(&ep->err_lock);
+
+	//printk(KERN_INFO "EXIT %s\n", __func__);
+}
+
+static void ft60x_data_read_bulk_callback(struct urb *urb)
+{
+	struct ft60x_endpoint *ep;
+
+	//printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
+
+	ep = urb->context;
+	spin_lock(&ep->err_lock);
+
+	/* sync/async unlink faults aren't errors */
+	if (urb->status) {
+		if (!(urb->status == -ENOENT ||
+		    urb->status == -ECONNRESET ||
+		    urb->status == -ESHUTDOWN))
+			dev_err(&ep->data_dev->interface->dev,
+				"%s - nonzero read bulk status received: %d\n",
 				__func__, urb->status);
 
 		ep->errors = urb->status;
@@ -1445,6 +1492,7 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool h
 	int rv = 0;
 	int readlen;
 	bool need_lock;
+	bool opened;
 
 	// printk(KERN_INFO "IN_FUNCTION %s\n", __func__);
 
@@ -1476,17 +1524,16 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool h
 	/*
 	 * in notification mode we may be called without the char dev opened,
 	 */
-	/* get the next empty node from the ring buffer */
-	// XXX
-	// if (!atomic_read(&ep->opened)) {
-	// }
-	rv = ft60x_ring_add_node(&ep->ring);
-	if (rv < 0) {
-		printk("cannot add node to ring\n");
-		goto exit;
-	}
+	opened = atomic_read(&ep->opened);
+	if (opened) {
+		/* get the next empty node from the ring buffer */
+		rv = ft60x_ring_add_node(&ep->ring);
+		if (rv < 0) {
+			printk(KERN_ERR "cannot add node to ring\n");
+			goto exit;
+		}
 
-	// printk(KERN_INFO "Ring add node: using node %p\n", ep->ring.wr);
+	}
 
 	/*
 	 * when in notification mode, we are called from callback context
@@ -1504,14 +1551,23 @@ static int ft60x_do_data_read_io(struct ft60x_endpoint *ep, size_t count, bool h
 		}
 	}
 
-	usb_fill_bulk_urb(ep->bulk_in_urb,
-			  ep->data_dev->udev,
-			  usb_rcvbulkpipe(ep->data_dev->udev,
-					  ep->bulk_in_endpointAddr),
-			  ep->ring.wr->bulk_in_buffer, readlen,
-			  ft60x_data_read_bulk_callback, ep);
+	if (opened) {
+		usb_fill_bulk_urb(ep->bulk_in_urb,
+				  ep->data_dev->udev,
+				  usb_rcvbulkpipe(ep->data_dev->udev,
+						  ep->bulk_in_endpointAddr),
+				  ep->ring.wr->bulk_in_buffer, readlen,
+				  ft60x_data_read_bulk_callback, ep);
+	} else {
+		//printk(KERN_INFO "char dev is not opened, ignoring data.\n");
+		usb_fill_bulk_urb(ep->bulk_in_urb,
+				  ep->data_dev->udev,
+				  usb_rcvbulkpipe(ep->data_dev->udev,
+						  ep->bulk_in_endpointAddr),
+				  ep->trash_buffer, readlen,
+				  ft60x_data_read_trash_callback, ep);
+	}
 
-	// printk(KERN_INFO "fill bulk in urb done %s\n", __func__);
 
 	/* tell everybody to leave the URB alone */
 	spin_lock_irq(&ep->err_lock);
