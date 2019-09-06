@@ -1313,6 +1313,7 @@ static int ft60x_data_open(struct inode *inode, struct file *file)
 
 	/* increment our usage count for the device */
 	kref_get(&ep->data_dev->kref);
+	kref_get(&ep->data_dev->ctrl_dev->kref);
 
 	/* save our object in the file's private structure */
 	file->private_data = ep;
