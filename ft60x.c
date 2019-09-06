@@ -520,6 +520,10 @@ static void ft60x_int_callback(struct urb *urb)
 
 	// printk(KERN_INFO "%s called\n", __func__);
 	ctrl_dev = urb->context;
+	if (!ctrl_dev) {
+		printk(KERN_ERR "%s - ctrl_dev was not found\n", __func__);
+		return;
+	}
 
 	switch (urb->status) {
 	case 0:
