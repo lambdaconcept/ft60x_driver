@@ -464,7 +464,7 @@ static int ft60x_send_cmd_read(struct usb_ft60x *dev, size_t count)
 	dev->ft->ctrlreq.pipe = dev->bulk_in_endpointAddr;
 	dev->ft->ctrlreq.cmd = 1;
 	if (notif) {
-		dev->ft->ctrlreq.len = min(dev->bulk_in_size * 128, dev->len_to_read);
+		dev->ft->ctrlreq.len = umin(dev->bulk_in_size * 128, dev->len_to_read);
 	} else {
 		dev->ft->ctrlreq.len = dev->bulk_in_size * 128;
 	}
@@ -507,8 +507,8 @@ static int ft60x_do_read_io(struct usb_ft60x *dev, size_t count)
 				  usb_rcvbulkpipe(dev->udev,
 						  dev->bulk_in_endpointAddr),
 				  dev->bulk_in_buffer,
-				  min(dev->bulk_in_size * 128,
-				      dev->len_to_read),
+				  umin(dev->bulk_in_size * 128,
+				       dev->len_to_read),
 				  ft60x_read_bulk_callback, dev);
 	} else {
 		usb_fill_bulk_urb(dev->bulk_in_urb,
@@ -1061,7 +1061,7 @@ static int ft60x_alloc_ctrl_interface(struct usb_ft60x *dev,
 			/* get a handle to the interrupt data pipe */
 			pipe = usb_rcvintpipe(dev->udev,
 					      endpoint->bEndpointAddress);
-			maxp = usb_maxpacket(dev->udev, pipe, usb_pipeout(pipe));
+			maxp = usb_maxpacket(dev->udev, pipe);
 			usb_fill_int_urb(dev->int_in_urb, dev->udev, pipe,
 					 dev->int_in_buffer, maxp,
 					 ft60x_int_callback, dev,
